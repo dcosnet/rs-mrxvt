@@ -1,0 +1,391 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>rs-mrxvt: A Modernized Power-User Terminal</title>
+<style>
+  /* ─── Reset + base ──────────────────────────────────────────────────── */
+  *, *::before, *::after { box-sizing: border-box; }
+  html { -webkit-text-size-adjust: 100%; }
+  body {
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+                 Oxygen, Ubuntu, Cantarell, "Open Sans", "Helvetica Neue",
+                 sans-serif;
+    font-size: 18px;
+    line-height: 1.65;
+    color: #e6e6e6;
+    background: #0d1117;
+    word-wrap: break-word;
+  }
+  /* ─── Layout ───────────────────────────────────────────────────────── */
+  .wrap {
+    max-width: 760px;
+    margin: 0 auto;
+    padding: 4rem 1.5rem 6rem;
+  }
+  header {
+    text-align: center;
+    margin-bottom: 3rem;
+    padding-bottom: 2rem;
+    border-bottom: 1px solid #21262d;
+  }
+  header .kicker {
+    text-transform: uppercase;
+    letter-spacing: 0.15em;
+    font-size: 0.75rem;
+    color: #8b949e;
+    margin-bottom: 0.5rem;
+  }
+  header h1 {
+    margin: 0 0 0.5rem;
+    font-size: 2.5rem;
+    font-weight: 700;
+    line-height: 1.2;
+    background: linear-gradient(135deg, #7aa2f7 0%, #bb9af7 50%, #f7768e 100%);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+  }
+  header .meta {
+    color: #8b949e;
+    font-size: 0.875rem;
+  }
+  article h2 {
+    margin-top: 3rem;
+    margin-bottom: 1rem;
+    font-size: 1.6rem;
+    font-weight: 600;
+    color: #f0f6fc;
+    border-bottom: 1px solid #21262d;
+    padding-bottom: 0.4rem;
+  }
+  article h3 {
+    margin-top: 2rem;
+    margin-bottom: 0.75rem;
+    font-size: 1.25rem;
+    font-weight: 600;
+    color: #c9d1d9;
+  }
+  article p { margin: 0 0 1.25rem; }
+  article ul, article ol { margin: 0 0 1.25rem; padding-left: 1.5rem; }
+  article li { margin-bottom: 0.4rem; }
+  /* ─── Inline code ───────────────────────────────────────────────────── */
+  code {
+    font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas,
+                 "Liberation Mono", monospace;
+    font-size: 0.9em;
+    background: #161b22;
+    color: #f0883e;
+    padding: 0.15em 0.35em;
+    border-radius: 4px;
+    border: 1px solid #21262d;
+  }
+  /* ─── Code blocks ───────────────────────────────────────────────────── */
+  pre {
+    background: #161b22;
+    border: 1px solid #21262d;
+    border-radius: 6px;
+    padding: 1rem 1.25rem;
+    overflow-x: auto;
+    margin: 0 0 1.5rem;
+    font-size: 0.875rem;
+    line-height: 1.5;
+  }
+  pre code {
+    background: transparent;
+    color: #c9d1d9;
+    border: none;
+    padding: 0;
+    font-size: inherit;
+  }
+  /* ─── Blockquote ────────────────────────────────────────────────────── */
+  blockquote {
+    margin: 1.5rem 0;
+    padding: 0.5rem 1.25rem;
+    border-left: 3px solid #7aa2f7;
+    background: rgba(122, 162, 247, 0.05);
+    color: #c9d1d9;
+    font-style: italic;
+  }
+  /* ─── Tables ────────────────────────────────────────────────────────── */
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 1.5rem 0;
+    font-size: 0.95rem;
+  }
+  th, td {
+    text-align: left;
+    padding: 0.6rem 0.8rem;
+    border-bottom: 1px solid #21262d;
+  }
+  th {
+    background: #161b22;
+    color: #f0f6fc;
+    font-weight: 600;
+  }
+  td code { font-size: 0.85em; }
+  /* ─── Callouts ──────────────────────────────────────────────────────── */
+  .callout {
+    background: rgba(158, 206, 106, 0.08);
+    border-left: 3px solid #9ece6a;
+    padding: 0.75rem 1.25rem;
+    margin: 1.5rem 0;
+    border-radius: 0 4px 4px 0;
+  }
+  .callout strong { color: #9ece6a; }
+  /* ─── Footer ────────────────────────────────────────────────────────── */
+  footer {
+    margin-top: 4rem;
+    padding-top: 2rem;
+    border-top: 1px solid #21262d;
+    text-align: center;
+    color: #8b949e;
+    font-size: 0.875rem;
+  }
+  footer a { color: #7aa2f7; text-decoration: none; }
+  footer a:hover { text-decoration: underline; }
+  /* ─── Links ─────────────────────────────────────────────────────────── */
+  a { color: #7aa2f7; text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  /* ─── Keyboard keys ─────────────────────────────────────────────────── */
+  kbd {
+    display: inline-block;
+    padding: 0.15em 0.5em;
+    font-size: 0.85em;
+    font-family: ui-monospace, SFMono-Regular, monospace;
+    line-height: 1;
+    color: #c9d1d9;
+    background: #21262d;
+    border: 1px solid #30363d;
+    border-bottom-width: 2px;
+    border-radius: 4px;
+    white-space: nowrap;
+  }
+  /* ─── Print-friendly ────────────────────────────────────────────────── */
+  @media print {
+    body { background: #fff; color: #000; font-size: 11pt; }
+    pre, code { background: #f4f4f4; color: #000; border-color: #ccc; }
+    a { color: #000; text-decoration: underline; }
+    .callout { background: #f4f4f4; border-color: #999; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <div class="kicker">Project writeup</div>
+  <h1>rs-mrxvt: A Modernized Power-User Terminal</h1>
+  <div class="meta">A distro-agnostic, Rust-based successor to the classic mrxvt — built for 2026 Linux desktops and 2008-era muscle memory.</div>
+</header>
+
+<article>
+
+<p>The original <code>mrxvt</code> was a tabbed terminal emulator written in C, popular in the mid-2000s for being lighter than <code>gnome-terminal</code> and more featureful than <code>xterm</code>. Its killer feature was <strong>input broadcasting</strong>: type in one tab, send the keystrokes to all of them simultaneously. Perfect for managing clusters of servers.</p>
+
+<p>It was also unmaintained by 2008, had no UTF-8 support worth speaking of, and crashed on malformed escape sequences.</p>
+
+<p><strong>rs-mrxvt</strong> is a from-scratch Rust rewrite that keeps the mrxvt soul — tabs, broadcasting, lightweight, power-user-oriented — and modernizes everything else. It runs on any Linux distro, picks the best available rendering backend automatically, and ships with the creature comforts you'd expect from a 2020s terminal: a command palette, true-color themes, hot-reloading Lua config, inline images, and clickable hyperlinks.</p>
+
+<h2>Design goals</h2>
+
+<ul>
+  <li><strong>Distro-agnostic.</strong> No assumptions about package managers, init systems, or display servers. One <code>sysprep.sh</code> detects your distro and installs the right deps. The default TUI backend works on anything that can run <code>ratatui</code> — even over SSH with no display.</li>
+  <li><strong>Backend auto-detect.</strong> The renderer picks the best available option at startup: <code>wgpu</code> (Vulkan) → <code>wgpu</code> (GL) → <code>softbuffer</code> (CPU raster, the modern VESA mode) → TUI (always works).</li>
+  <li><strong>Memory-safe core.</strong> The original mrxvt was plagued by buffer overflows. Rust's borrow checker eliminates that class of bug by construction.</li>
+  <li><strong>Feature-flagged.</strong> Build only what you need. <code>--features lua</code> adds dynamic config; <code>--features images</code> adds Sixel + iTerm2 image protocol; <code>--features gpu</code> adds the wgpu + softbuffer renderers. The default build has zero system graphics dependencies.</li>
+</ul>
+
+<h2>The killer feature, reborn</h2>
+
+<p>Input broadcasting works exactly as you remember it, plus a modern twist. Three modes:</p>
+
+<ul>
+  <li><strong>Active</strong> — input goes to the focused tab only (default).</li>
+  <li><strong>All</strong> — input goes to every open tab. The status bar turns red and shows <code>● BROADCAST:All</code>. Toggle with <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>I</kbd>.</li>
+  <li><strong>Group</strong> — input goes only to tabs tagged with a specific name. Tag tabs with <code>-g &lt;name&gt;</code> on the CLI or via the command palette. Useful for "broadcast to all my web servers but not the database tab".</li>
+</ul>
+
+<p>The classic flag is preserved: <code>rs-mrxvt -n 5 -j -g web</code> opens 5 tabs tagged "web" with broadcast on. Type <code>apt update &amp;&amp; apt upgrade -y</code> once, watch it run on all five.</p>
+
+<h2>Keybindings (modern + classic)</h2>
+
+<p>Both schools of muscle memory are honored:</p>
+
+<table>
+  <thead>
+    <tr><th>Shortcut</th><th>Action</th><th>Style</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><kbd>Alt</kbd>+<kbd>N</kbd></td><td>New bash tab</td><td>Modern</td></tr>
+    <tr><td><kbd>Alt</kbd>+<kbd>Z</kbd></td><td>New zsh tab</td><td>Modern</td></tr>
+    <tr><td><kbd>Alt</kbd>+<kbd>Shift</kbd>+<kbd>X</kbd></td><td>Close focused tab</td><td>Modern</td></tr>
+    <tr><td><kbd>Alt</kbd>+<kbd>1</kbd> … <kbd>Alt</kbd>+<kbd>0</kbd></td><td>Go to tab 1..10</td><td>Classic mrxvt</td></tr>
+    <tr><td><kbd>Alt</kbd>+<kbd>←</kbd> / <kbd>Alt</kbd>+<kbd>→</kbd></td><td>Shuffle prev/next tab</td><td>Modern</td></tr>
+    <tr><td><kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>T</kbd></td><td>New tab</td><td>Classic mrxvt</td></tr>
+    <tr><td><kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>W</kbd></td><td>Close tab</td><td>Classic mrxvt</td></tr>
+    <tr><td><kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>I</kbd></td><td>Toggle broadcast</td><td>Classic mrxvt</td></tr>
+    <tr><td><kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>P</kbd></td><td>Command palette</td><td>Modern (Warp/VS Code style)</td></tr>
+  </tbody>
+</table>
+
+<p>All bindings are rebindable in <code>config.toml</code> or <code>config.lua</code>.</p>
+
+<h2>The command palette</h2>
+
+<p>Press <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>P</kbd> and a fuzzy-search overlay appears over the terminal. Every command — new tab, close tab, toggle broadcast, reset terminal, switch theme — is searchable by name. No more memorizing obscure chords.</p>
+
+<p>This is the Warp / VS Code influence. The classic mrxvt had hidden shortcuts; rs-mrxvt surfaces them all in a discoverable UI.</p>
+
+<h2>Configuration: TOML today, Lua tomorrow (today)</h2>
+
+<p>Two config formats, picked automatically by file extension:</p>
+
+<h3>TOML — for static config</h3>
+
+<pre><code>[terminal]
+cols = 120
+rows = 40
+shell = "/bin/bash"
+
+[ui]
+theme = "tokyo-night"
+
+[profiles.default]
+command = ["bash"]
+
+[profiles.zsh]
+command = ["zsh"]
+
+[profiles.web-1]
+command = ["ssh", "user@web-01.example.com"]
+tag = "web"
+
+[transparency]
+enabled = true
+tint = "#004080"
+opacity = 0.85</code></pre>
+
+<h3>Lua — for dynamic config</h3>
+
+<p>Requires <code>--features lua</code>. The same config, but with logic:</p>
+
+<pre><code>local hour = tonumber(os.date("%H"))
+local theme = "mrxvt"
+if hour &gt;= 20 or hour &lt; 6 then
+  theme = "tokyo-night"
+end
+
+local is_ssh = os.getenv("SSH_CLIENT") ~= nil
+local shell = is_ssh and "/bin/sh" or "/bin/bash"
+
+return {
+  ui = { theme = theme },
+  terminal = { cols = 120, rows = 40, shell = shell },
+  profiles = {
+    default = { command = { shell } },
+    zsh = { command = { "zsh" } },
+  },
+}</code></pre>
+
+<p>Config files hot-reload on save — no restart needed. The polling watcher survives bad configs (logs a warning, keeps the last good config).</p>
+
+<h2>Themes</h2>
+
+<p>Six built-in true-color themes:</p>
+
+<table>
+  <thead><tr><th>Theme</th><th>Vibe</th></tr></thead>
+  <tbody>
+    <tr><td><code>mrxvt</code></td><td>Classic green-on-black (default)</td></tr>
+    <tr><td><code>tokyo-night</code></td><td>Dark blue, popularized by VS Code</td></tr>
+    <tr><td><code>gruvbox</code></td><td>Warm retro palette</td></tr>
+    <tr><td><code>dracula</code></td><td>Dark purple</td></tr>
+    <tr><td><code>solarized-dark</code></td><td>Solarized Dark</td></tr>
+    <tr><td><code>solarized-light</code></td><td>Solarized Light</td></tr>
+  </tbody>
+</table>
+
+<p>Custom themes can be defined inline in TOML — all 16 ANSI colors plus bg/fg/cursor.</p>
+
+<h2>Image protocol support</h2>
+
+<p>With <code>--features images</code>, rs-mrxvt understands both major inline-image protocols:</p>
+
+<ul>
+  <li><strong>iTerm2 inline images</strong> (<code>ESC ] 1337 ; File = ...</code>) — PNG, JPEG, GIF, WebP, BMP. Compatible with <code>ranger</code>, <code>neofetch</code>, <code>chafa</code>, <code>viu</code>.</li>
+  <li><strong>Sixel</strong> (<code>DCS q ... ST</code>) — the old DEC format, still used by <code>mlterm</code> and <code>xterm -ti vt340</code>. The parser is pure Rust.</li>
+</ul>
+
+<p>Images are stored in a thread-safe <code>ImageStore</code> keyed by ID; the renderer composites them at the appropriate cell coordinates.</p>
+
+<h2>Hyperlinks</h2>
+
+<p>OSC 8 (<code>ESC ] 8 ; ... ST</code>) lets programs mark ranges of cells as clickable hyperlinks. <code>ls --hyperlink=auto</code>, modern <code>gcc</code> diagnostics, and various TUI file managers use this. rs-mrxvt has a streaming scanner that extracts these from the PTY byte stream and a cell-indexed store for fast hit-testing.</p>
+
+<h2>Mouse support</h2>
+
+<p>Three mouse reporting modes — X10, X11 normal, SGR-1006 — are all implemented. When the child program enables reporting, mouse events are encoded and forwarded. When it hasn't, mouse events drive local text selection (click-drag to select, release to copy).</p>
+
+<h2>Performance</h2>
+
+<div class="callout">
+  <strong>Benchmark:</strong> 50 PTYs spawned in 0.29s, broadcast marker delivered to all 50 in 0.04s — <strong>2372 tabs/sec</strong> broadcast throughput on the 50-instance stress harness.
+</div>
+
+<p>Each tab runs its own reader thread with a bounded channel, so one tab's heavy output never blocks the UI thread. The wgpu backend renders the full terminal grid with an instanced quad pipeline (one draw call per frame) and a lazily-uploaded glyph atlas.</p>
+
+<h2>Distro support</h2>
+
+<p>The <code>sysprep.sh</code> script auto-detects your distro and installs the right packages:</p>
+
+<table>
+  <thead><tr><th>Distro family</th><th>Package manager</th></tr></thead>
+  <tbody>
+    <tr><td>Arch, Manjaro, EndeavourOS, Garuda, Artix</td><td><code>pacman</code></td></tr>
+    <tr><td>Debian, Ubuntu, Pop!_OS, Mint, Elementary, Kali, Raspbian</td><td><code>apt</code></td></tr>
+    <tr><td>Fedora, RHEL, Rocky, Alma, CentOS, Amazon Linux</td><td><code>dnf</code></td></tr>
+    <tr><td>openSUSE, SUSE Linux Enterprise</td><td><code>zypper</code></td></tr>
+    <tr><td>Void</td><td><code>xbps-install</code></td></tr>
+    <tr><td>Alpine</td><td><code>apk</code></td></tr>
+    <tr><td>NixOS</td><td>prints a <code>shell.nix</code> recipe</td></tr>
+    <tr><td>SourceMage</td><td><code>cast</code></td></tr>
+    <tr><td>Gentoo, Funtoo</td><td><code>emerge</code></td></tr>
+  </tbody>
+</table>
+
+<p>One command from a fresh checkout to a system-installed binary:</p>
+
+<pre><code>sudo ./install.sh --sysprep</code></pre>
+
+<h2>The architecture in one paragraph</h2>
+
+<p>The app owns a <code>TerminalManager</code> (vec of <code>TerminalTab</code>s, each with a PTY + an <code>alacritty_terminal::Term</code> + a reader thread), an <code>InputRouter</code> (translates key chords to <code>Command</code>s or raw bytes), a <code>PaletteState</code> (command palette), and a <code>SessionState</code> (mouse, selection, hyperlinks, images). The renderer is a trait — <code>TuiRenderer</code> (ratatui + crossterm) is the default; <code>WgpuRenderer</code> (Vulkan/GL) and <code>SoftRenderer</code> (CPU raster via tiny-skia) are opt-in. Auto-detect probes in priority order: wgpu → soft → tui. Every backend translates its native events into <code>AppEvent</code> at the renderer boundary, so the app loop is fully backend-agnostic.</p>
+
+<h2>Try it</h2>
+
+<pre><code># Clone the repo, then:
+./scripts/sysprep.sh            # install build deps for your distro
+./scripts/build.sh              # cargo build --release --features lua,images,gpu
+./target/release/rs-mrxvt       # run it
+
+# Or in one shot:
+sudo ./install.sh --sysprep</code></pre>
+
+<p>For the full feature list and config schema, see the <a href="https://example.com/rs-mrxvt">README</a>. For a 60-second tour, see the <a href="https://example.com/rs-mrxvt/quickstart">Quick Start</a>.</p>
+
+</article>
+
+<footer>
+  <p>rs-mrxvt is MIT-licensed. Source and issue tracker at
+  <a href="https://example.com/rs-mrxvt">example.com/rs-mrxvt</a>.</p>
+  <p>This page is a portable, self-contained HTML file — no external
+  dependencies, no JS, prints cleanly. Reuse the wording freely.</p>
+</footer>
+
+</div>
+</body>
+</html>

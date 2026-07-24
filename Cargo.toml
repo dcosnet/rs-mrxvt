@@ -1,0 +1,110 @@
+[package]
+name = "rs-mrxvt"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+authors = ["rs-mrxvt contributors"]
+license = "GPL-2.0-or-later"
+description = "A modernized, distro-agnostic mrxvt-inspired terminal emulator written in Rust"
+repository = "https://example.com/rs-mrxvt"
+homepage = "https://example.com/rs-mrxvt"
+keywords = ["terminal", "mrxvt", "tabs", "broadcasting", "tui"]
+categories = ["command-line-utilities"]
+readme = "README.md"
+exclude = [
+    "/target",
+    "/scripts/stress_test.py",
+    "/docs",
+]
+
+[lib]
+name = "mrxvt"
+path = "src/lib.rs"
+
+[[bin]]
+name = "rs-mrxvt"
+path = "src/main.rs"
+
+[dependencies]
+# --- Terminal emulation (pure Rust, no GUI deps) ---
+alacritty_terminal = "0.26"
+portable-pty = "0.9"
+
+# --- TUI rendering (cross-platform, distro-agnostic; default backend) ---
+ratatui = "0.29"
+crossterm = "0.28"
+
+# --- Async + concurrency ---
+tokio = { version = "1", features = ["rt", "sync", "time", "macros", "io-util", "process", "fs"] }
+crossbeam-channel = "0.5"
+
+# --- Config + serialization ---
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+
+# --- Misc utilities ---
+anyhow = "1"
+libc = "0.2"
+thiserror = "1"
+log = "0.4"
+env_logger = "0.11"
+clap = { version = "4", features = ["derive", "env"] }
+shellexpand = "3"
+fuzzy-matcher = "0.3"
+unicode-width = "0.2"
+
+# --- GPU / software-rasterizer backend (opt-in via --features gpu) ---
+# These pull in wgpu + winit + softbuffer + tiny-skia, which need Vulkan/Wayland/X11
+# dev headers to compile. Gated behind a feature so the default build stays
+# lightweight and works in any environment (SSH, headless, CI, etc.).
+wgpu = { version = "22", optional = true }
+winit = { version = "0.29", optional = true, features = ["wayland", "x11"] }
+softbuffer = { version = "0.4", optional = true }
+tiny-skia = { version = "0.11", optional = true }
+ab_glyph = { version = "0.2", optional = true }
+pollster = { version = "0.4", optional = true }
+raw-window-handle = { version = "0.6", optional = true }
+bytemuck = { version = "1", optional = true, features = ["derive"] }
+
+# --- Lua config (opt-in via --features lua) ---
+# Enables dynamic, programmable configuration via config.lua. Uses mlua with
+# the vendored Lua 5.4 build so there's no system liblua dependency.
+mlua = { version = "0.10", optional = true, features = ["lua54", "vendored"] }
+
+# --- Sixel / image protocol (opt-in via --features images) ---
+# Pulls in image decoders for Sixel and iTerm2 inline image support.
+image = { version = "0.25", optional = true }
+
+[features]
+default = []
+# Enable the wgpu + softbuffer backends. Requires libwayland-dev, libxkbcommon-dev,
+# and libvulkan-dev (or their distro equivalents) at build time.
+gpu = [
+    "dep:wgpu",
+    "dep:winit",
+    "dep:softbuffer",
+    "dep:tiny-skia",
+    "dep:ab_glyph",
+    "dep:pollster",
+    "dep:raw-window-handle",
+    "dep:bytemuck",
+]
+# Enable Lua config support. No system deps (mlua vendors Lua 5.4).
+lua = ["dep:mlua"]
+# Enable Sixel / iTerm2 image protocol support.
+images = ["dep:image"]
+
+[dev-dependencies]
+pretty_assertions = "1"
+tempfile = "3"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
+panic = "abort"
+
+[profile.dev]
+opt-level = 0
+debug = true

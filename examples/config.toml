@@ -1,0 +1,84 @@
+# rs-mrxvt example config.
+#
+# Copy to ~/.config/rs-mrxvt/config.toml and edit.
+# Every key is optional; sensible defaults are applied if omitted.
+
+# ──────────────────────────────────────────────────────────────────────────
+# Terminal defaults (apply to every tab unless overridden by a profile)
+# ──────────────────────────────────────────────────────────────────────────
+[terminal]
+cols = 120
+rows = 40
+scrollback = 10000          # lines of scrollback history per tab
+shell = "/bin/bash"          # default shell (bash); override per-profile
+
+# ──────────────────────────────────────────────────────────────────────────
+# UI behavior
+# ──────────────────────────────────────────────────────────────────────────
+[ui]
+always_show_tabs = true     # show the tab bar even with one tab
+disable_palette = false     # set true to disable Ctrl+Shift+P
+tabbar_height = 1           # tab bar height in terminal rows
+theme = "mrxvt"             # "mrxvt" (classic green-on-black) | "tokyo-night" | "gruvbox"
+focus = "click"             # "click" (default) | "follow" (focus follows mouse)
+
+# ──────────────────────────────────────────────────────────────────────────
+# Default profile (used when rs-mrxvt is launched with no -e flag)
+# ──────────────────────────────────────────────────────────────────────────
+default_profile = "default"
+
+[profiles.default]
+command = ["bash"]           # bash is the primary shell
+# cwd = "/home/user/projects"
+# tag = "local"
+
+# ──────────────────────────────────────────────────────────────────────────
+# zsh profile — launched with Alt+Z
+# ──────────────────────────────────────────────────────────────────────────
+[profiles.zsh]
+command = ["zsh"]
+
+# ──────────────────────────────────────────────────────────────────────────
+# Example: a fleet of web servers you want to broadcast to
+# ──────────────────────────────────────────────────────────────────────────
+[profiles.web-1]
+command = ["ssh", "user@web-01.example.com"]
+tag = "web"
+
+[profiles.web-2]
+command = ["ssh", "user@web-02.example.com"]
+tag = "web"
+
+[profiles.web-3]
+command = ["ssh", "user@web-03.example.com"]
+tag = "web"
+
+# ──────────────────────────────────────────────────────────────────────────
+# Example: a database admin tab (untagged — won't receive group broadcasts)
+# ──────────────────────────────────────────────────────────────────────────
+[profiles.db]
+command = ["ssh", "user@db-01.example.com"]
+# no tag → only receives input when active or when broadcast = All
+
+# ──────────────────────────────────────────────────────────────────────────
+# Environment overrides per profile
+# ──────────────────────────────────────────────────────────────────────────
+[profiles.monitoring]
+command = ["htop"]
+env = { HTOPRC = "/home/user/.config/htop/mrxvt-rc" }
+
+# ──────────────────────────────────────────────────────────────────────────
+# Macros: chord → command name (must match a `Command` variant)
+# ──────────────────────────────────────────────────────────────────────────
+[macros]
+"Ctrl+Shift+R" = "ResetTerminal"
+# "Ctrl+Shift+B" = "ToggleBroadcastAll"
+
+# ──────────────────────────────────────────────────────────────────────────
+# Pseudo-transparency + tinting (requires --features gpu + a GUI backend)
+# ──────────────────────────────────────────────────────────────────────────
+[transparency]
+enabled = false              # set true to enable
+tint = "#004080"              # tint color as #RRGGBB
+opacity = 0.85                # 0.0 (invisible) to 1.0 (opaque)
+# background_image = "/path/to/wallpaper.png"   # optional
