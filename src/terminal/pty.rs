@@ -25,6 +25,7 @@
 //! without spawning a thread per tab (the original mrxvt did per-tab threads;
 //! we use a single poller for the whole app to keep things cache-friendly).
 
+use std::cell::RefCell;
 use std::io::{self, Read, Write};
 
 use anyhow::{Context, Result};
@@ -34,14 +35,30 @@ use crate::config::Profile;
 
 /// A live PTY session.
 ///
-/// The master is held as a `Box<dyn MasterPty>` (the type portable-pty
-/// returns). If you need shared access across threads, wrap the whole
-/// `PtySession` in an `Arc<Mutex<_>>` — the per-tab state is small enough
-/// that this is cheaper than trying to share the master alone.
+/// The master is held as a `Box<dyn MasterPty + Send>`. If you need shared
+/// access across threads, wrap the whole `PtySession` in an `Arc<Mutex<_>>`
+/// — the per-tab state is small enough that this is cheaper than trying to
+/// share the master alone.
+///
+/// ## Writer lifetime
+///
+/// The PTY writer is taken **once** at spawn (via `MasterPty::take_writer()`)
+/// and held for the lifetime of this `PtySession`. This is mandatory:
+/// `portable_pty` explicitly forbids calling `take_writer()` more than once,
+/// and dropping the writer sends EOF to the child process (its `Drop` impl
+/// writes `\n` + VEOF to the PTY). If we took a fresh writer per write — as
+/// an earlier version did — the first keystroke would kill the child shell
+/// and every subsequent keystroke would silently fail.
 pub struct PtySession {
     pub master: Box<dyn MasterPty + Send>,
     pub pid: u32,
     pub reader: Box<dyn Read + Send>,
+    /// The single PTY writer, held for the session lifetime. `RefCell`
+    /// because `Write::write` needs `&mut self` while the public API
+    /// (`write_input`, `route_input`) threads `&self` through the
+    /// broadcast fan-out. All access is from the main event-loop thread,
+    /// so `RefCell` (not `Mutex`) is the right primitive.
+    writer: RefCell<Box<dyn Write + Send>>,
 }
 
 impl PtySession {
@@ -73,23 +90,32 @@ impl PtySession {
             .try_clone_reader()
             .context("cloning pty reader")?;
 
+        // Take the writer ONCE, now, and hold it for the session lifetime.
+        // portable_pty forbids a second `take_writer()` call, and dropping
+        // the writer sends EOF to the child — both of which would break
+        // per-write writer acquisition.
+        let writer = pair
+            .master
+            .take_writer()
+            .context("taking pty writer")?;
+
         let master = pair.master;
 
         // Drop the slave handle in the parent. The child still has its FDs
         // (inherited via dup2 inside portable-pty) so it can keep talking.
         drop(pair.slave);
 
-        Ok(Self { master, pid, reader })
+        Ok(Self { master, pid, reader, writer: RefCell::new(writer) })
     }
 
     /// Send raw bytes to the child process (e.g. keystrokes, paste).
+    ///
+    /// Borrows the session-long writer via `RefCell`; all writes go through
+    /// the same `Box<dyn Write + Send>` taken at spawn.
     pub fn write_all(&self, data: &[u8]) -> io::Result<()> {
-        let mut writer = self
-            .master
-            .take_writer()
-            .map_err(|e| io::Error::other(e.to_string()))?;
-        writer.write_all(data)?;
-        writer.flush()
+        let mut w = self.writer.borrow_mut();
+        w.write_all(data)?;
+        w.flush()
     }
 
     /// Resize the PTY. Called when the window/tab area changes.
@@ -182,5 +208,73 @@ mod tests {
         let n = session.reader.read(&mut buf).unwrap();
         let out = String::from_utf8_lossy(&buf[..n]);
         assert!(out.contains("hello"), "got: {out:?}");
+    }
+
+    /// Regression test for the "first keystroke kills the shell" bug.
+    ///
+    /// The old `write_all` called `take_writer()` on every write. portable_pty
+    /// forbids that ("cannot take writer more than once") AND its writer's
+    /// `Drop` sends EOF to the child. So the first write succeeded but killed
+    /// the shell, and every subsequent write failed silently.
+    ///
+    /// This test writes multiple times through the same `PtySession` and
+    /// verifies that (a) every write returns Ok and (b) the child `cat`
+    /// process is still alive (we can read back the echo of the second write).
+    #[test]
+    fn multiple_writes_do_not_kill_child() {
+        let p = Profile {
+            command: vec!["cat".into()],
+            cwd: None,
+            tag: None,
+            env: HashMap::new(),
+        };
+        let mut session = PtySession::spawn(&p, "/bin/sh", 40, 10).unwrap();
+
+        // First write must succeed.
+        session.write_all(b"first\n").expect("first write should succeed");
+
+        // Give `cat` a moment to echo it back so we can drain it.
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        let mut drain = [0u8; 128];
+        let _ = session.reader.read(&mut drain);
+
+        // Second write must ALSO succeed — this is the regression.
+        // The old code failed here with "cannot take writer more than once".
+        session.write_all(b"second\n").expect("second write should succeed");
+
+        // Read back the echo of the second write. If the first write's
+        // writer-drop had sent EOF, `cat` would have exited and we'd see
+        // EOF (0 bytes) instead of "second".
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        let mut buf = [0u8; 128];
+        let n = session.reader.read(&mut buf).expect("read should not error");
+        let out = String::from_utf8_lossy(&buf[..n]);
+        assert!(
+            out.contains("second"),
+            "child should have echoed 'second' back, got {out:?} ({} bytes)",
+            n
+        );
+    }
+
+    /// The writer is taken exactly once at spawn; calling write_all many
+    /// times must never error or panic.
+    #[test]
+    fn many_sequential_writes_all_succeed() {
+        let p = Profile {
+            command: vec!["cat".into()],
+            cwd: None,
+            tag: None,
+            env: HashMap::new(),
+        };
+        let mut session = PtySession::spawn(&p, "/bin/sh", 40, 10).unwrap();
+
+        for i in 0..50 {
+            session.write_all(format!("line {i}\n").as_bytes())
+                .expect("every write should succeed");
+            // Drain the echo so the PTY buffer doesn't fill and block.
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            let mut drain = [0u8; 256];
+            let _ = session.reader.read(&mut drain);
+        }
     }
 }
