@@ -112,6 +112,35 @@ impl TerminalManager {
         self.close_tab(i)
     }
 
+    /// Close every tab whose child process has exited (`eof_seen == true`).
+    ///
+    /// Called once per event-loop tick after `poll_all`. Dead tabs are removed
+    /// and the active index is adjusted to stay in bounds (via `close_tab`).
+    ///
+    /// Returns `true` when no tabs remain — the caller should quit the app.
+    /// This gives the classic terminal behaviour:
+    /// - `exit` in the **last** tab → app quits.
+    /// - `exit` in **any other** tab → only that tab closes.
+    pub fn close_dead_tabs(&mut self) -> bool {
+        // Collect indices of dead tabs, then remove in reverse order so
+        // earlier removals don't shift the indices we haven't reached yet.
+        let dead: Vec<usize> = self
+            .tabs
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| t.eof_seen)
+            .map(|(i, _)| i)
+            .collect();
+
+        for i in dead.into_iter().rev() {
+            let title = self.tabs.get(i).map(|t| t.title.as_str()).unwrap_or("?");
+            log::info!("tab {i} ({title}): child process exited, closing tab");
+            self.close_tab(i);
+        }
+
+        self.tabs.is_empty()
+    }
+
     /// Get the active tab (immutable).
     pub fn active_tab(&self) -> Option<&TerminalTab> {
         self.tabs.get(self.active)
@@ -465,5 +494,108 @@ mod tests {
         let mut m = fresh_manager();
         let cfg = Config::default();
         assert_eq!(m.execute(&Command::Quit, 40, 10, &cfg), Action::Quit);
+    }
+
+    // ─── close_dead_tabs tests ───────────────────────────────────────────
+    //
+    // These test the "exit closes the tab; exit in the last tab quits the
+    // app" behaviour. Each test spawns real child processes (`true` exits
+    // immediately, `sleep 10` stays alive) and waits for the reader thread
+    // to deliver the EOF sentinel through the channel.
+
+    /// Wait for at least one tab to see EOF, with a timeout. This mirrors
+    /// what the real main loop does: poll_all sets eof_seen, then
+    /// close_dead_tabs acts on it.
+    fn wait_for_any_eof(m: &mut TerminalManager, timeout_ms: u64) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+        while std::time::Instant::now() < deadline {
+            m.poll_all();
+            if m.tabs.iter().any(|t| t.eof_seen) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn close_dead_tabs_quits_when_last_tab_exits() {
+        let mut m = TerminalManager::new(&Config::default());
+        let p = test_profile("true"); // exits immediately
+        let _ = m.open_tab(&p, Some("only".into()), 40, 10);
+
+        wait_for_any_eof(&mut m, 2000);
+        assert!(m.tabs[0].eof_seen, "tab should have observed EOF");
+
+        let should_quit = m.close_dead_tabs();
+        assert!(should_quit, "should quit — last tab closed");
+        assert!(m.tabs.is_empty());
+    }
+
+    #[test]
+    fn close_dead_tabs_keeps_alive_tabs_and_only_removes_dead_ones() {
+        let mut m = TerminalManager::new(&Config::default());
+        let dead_p = test_profile("true");
+        let alive_p = test_profile("sleep 10");
+        let _ = m.open_tab(&dead_p, Some("dead".into()), 40, 10);
+        let _ = m.open_tab(&alive_p, Some("alive".into()), 40, 10);
+
+        wait_for_any_eof(&mut m, 2000);
+
+        let should_quit = m.close_dead_tabs();
+        assert!(!should_quit, "should NOT quit — one tab still alive");
+        assert_eq!(m.tabs.len(), 1, "only the dead tab should be removed");
+        assert_eq!(m.tabs[0].title, "alive");
+    }
+
+    #[test]
+    fn close_dead_tabs_is_noop_when_all_tabs_alive() {
+        let mut m = fresh_manager(); // two tabs running "sleep 5"
+        let should_quit = m.close_dead_tabs();
+        assert!(!should_quit);
+        assert_eq!(m.tabs.len(), 2, "no tabs should be closed");
+    }
+
+    #[test]
+    fn close_dead_tabs_adjusts_active_index_when_active_tab_dies() {
+        let mut m = TerminalManager::new(&Config::default());
+        let alive_p = test_profile("sleep 10");
+        let dead_p = test_profile("true");
+        let _ = m.open_tab(&alive_p, Some("alive".into()), 40, 10); // index 0
+        let _ = m.open_tab(&dead_p, Some("dead".into()), 40, 10); //  index 1
+        m.active = 1; // user is looking at the tab that's about to die
+
+        wait_for_any_eof(&mut m, 2000);
+
+        let should_quit = m.close_dead_tabs();
+        assert!(!should_quit);
+        assert_eq!(m.tabs.len(), 1);
+        assert_eq!(
+            m.active, 0,
+            "active should fall back to the remaining tab"
+        );
+        assert_eq!(m.tabs[0].title, "alive");
+    }
+
+    #[test]
+    fn close_dead_tabs_handles_multiple_simultaneous_exits() {
+        let mut m = TerminalManager::new(&Config::default());
+        let p = test_profile("true");
+        let _ = m.open_tab(&p, Some("a".into()), 40, 10);
+        let _ = m.open_tab(&p, Some("b".into()), 40, 10);
+        let _ = m.open_tab(&p, Some("c".into()), 40, 10);
+
+        wait_for_any_eof(&mut m, 2000);
+        // Wait a bit longer so all three tabs see EOF.
+        for _ in 0..50 {
+            m.poll_all();
+            if m.tabs.iter().all(|t| t.eof_seen) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        let should_quit = m.close_dead_tabs();
+        assert!(should_quit, "all tabs exited — should quit");
+        assert!(m.tabs.is_empty());
     }
 }

@@ -378,7 +378,7 @@ impl App {
         let poll_ms = 50; // 20 Hz input poll; PTY drain is per-tick.
         while !self.quit {
             // 1. Drain PTYs.
-            let (_active_changed, any_eof) = self.manager.poll_all();
+            let (_active_changed, _any_eof) = self.manager.poll_all();
 
             // 2. Poll for input.
             while let Some(ev) = renderer.poll_event(poll_ms)? {
@@ -390,14 +390,12 @@ impl App {
                 }
             }
 
-            // 3. Handle EOF on a tab — close it.
-            if any_eof {
-                // Heuristic: close active tab if its child has exited.
-                // For the MVP we don't track which tab EOF'd; closing the
-                // active one matches user expectation most of the time.
-                // (A more robust approach tracks EOF per-tab.)
-                // We avoid closing if there's still data being produced.
-                // For now: don't auto-close; the user can press Ctrl+Shift+W.
+            // 3. Close tabs whose child process has exited. If the last tab
+            // closed, quit the app — classic terminal behaviour:
+            //   `exit` in the last tab → app quits
+            //   `exit` in any other tab → only that tab closes
+            if self.manager.close_dead_tabs() {
+                self.quit = true;
             }
 
             // 4. Render.
