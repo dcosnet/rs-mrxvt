@@ -180,6 +180,15 @@ impl GlyphCache {
     pub fn pixel_size(&self) -> f32 {
         self.scale.y
     }
+
+    /// Iterate over all cached glyphs: `(char, bold, italic, &CachedGlyph)`.
+    ///
+    /// Used by the wgpu renderer to rebuild the atlas texture when new glyphs
+    /// are rasterized. Without this, the atlas would only cover ASCII and
+    /// every non-ASCII character would render as an empty cell.
+    pub fn iter(&self) -> impl Iterator<Item = ((char, bool, bool), &CachedGlyph)> {
+        self.cache.iter().map(|(&(c, b, i), g)| ((c, b, i), g))
+    }
 }
 
 /// Return a bundled monospace font. We use DejaVu Sans Mono, which is a

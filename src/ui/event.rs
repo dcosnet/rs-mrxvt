@@ -208,6 +208,163 @@ impl From<CrosstermKey> for AppEvent {
     }
 }
 
+// ─── winit translations (gpu feature: wgpu + softbuffer backends) ───────────
+
+#[cfg(feature = "gpu")]
+pub mod winit_translate {
+    use winit::event::{ElementState, Event, KeyEvent, WindowEvent};
+    use winit::event_loop::EventLoopWindowTarget;
+    use winit::keyboard::{Key, ModifiersState, NamedKey};
+
+    use super::{AppEvent, AppKey, AppKeyEvent, AppModifiers};
+
+    /// Tracks the current keyboard modifier state.
+    ///
+    /// Updated by `WindowEvent::ModifiersChanged` events, read when
+    /// translating `WindowEvent::KeyboardInput` events.
+    #[derive(Clone, Copy, Default)]
+    pub struct ModifierTracker {
+        mods: ModifiersState,
+    }
+
+    impl ModifierTracker {
+        pub fn update(&mut self, mods: ModifiersState) {
+            self.mods = mods;
+        }
+
+        pub fn to_app_modifiers(&self) -> AppModifiers {
+            AppModifiers {
+                shift: self.mods.shift_key(),
+                ctrl: self.mods.control_key(),
+                alt: self.mods.alt_key(),
+                super_key: self.mods.super_key(),
+            }
+        }
+    }
+
+    /// Translate a winit `KeyEvent` into an `AppKeyEvent`.
+    ///
+    /// Returns `None` for keys we don't recognise (rare hardware keys, dead
+    /// keys, etc.) — the caller silently drops them.
+    pub fn winit_key_to_app_key(ev: &KeyEvent, mods: AppModifiers) -> Option<AppKeyEvent> {
+        let key = match &ev.logical_key {
+            Key::Character(s) => {
+                // Take the first character. For most keypresses this is a
+                // single-char string; for edge cases (e.g. dead-key sequences
+                // producing multi-char strings) we take the first.
+                AppKey::Char(s.chars().next().unwrap_or(' '))
+            }
+            Key::Named(n) => named_to_app_key(n)?,
+            _ => return None,
+        };
+        Some(AppKeyEvent {
+            mods,
+            key,
+            released: ev.state == ElementState::Released,
+        })
+    }
+
+    fn named_to_app_key(n: &NamedKey) -> Option<AppKey> {
+        Some(match n {
+            NamedKey::Enter => AppKey::Enter,
+            NamedKey::Tab => AppKey::Tab,
+            NamedKey::Space => AppKey::Space,
+            NamedKey::Backspace => AppKey::Backspace,
+            NamedKey::Escape => AppKey::Esc,
+            NamedKey::ArrowUp => AppKey::Up,
+            NamedKey::ArrowDown => AppKey::Down,
+            NamedKey::ArrowLeft => AppKey::Left,
+            NamedKey::ArrowRight => AppKey::Right,
+            NamedKey::Home => AppKey::Home,
+            NamedKey::End => AppKey::End,
+            NamedKey::PageUp => AppKey::PageUp,
+            NamedKey::PageDown => AppKey::PageDown,
+            NamedKey::Insert => AppKey::Insert,
+            NamedKey::Delete => AppKey::Delete,
+            NamedKey::F1 => AppKey::F(1),
+            NamedKey::F2 => AppKey::F(2),
+            NamedKey::F3 => AppKey::F(3),
+            NamedKey::F4 => AppKey::F(4),
+            NamedKey::F5 => AppKey::F(5),
+            NamedKey::F6 => AppKey::F(6),
+            NamedKey::F7 => AppKey::F(7),
+            NamedKey::F8 => AppKey::F(8),
+            NamedKey::F9 => AppKey::F(9),
+            NamedKey::F10 => AppKey::F(10),
+            NamedKey::F11 => AppKey::F(11),
+            NamedKey::F12 => AppKey::F(12),
+            _ => return None,
+        })
+    }
+
+    /// Translate a top-level winit `Event` into an `AppEvent`.
+    ///
+    /// `tracker` is updated in place when modifier-state events arrive.
+    /// Returns `None` for events that don't map to an `AppEvent` (most
+    /// events — winit emits a lot of internal events we don't care about).
+    pub fn translate_event(
+        event: &Event<()>,
+        tracker: &mut ModifierTracker,
+        _elwt: &EventLoopWindowTarget<()>,
+    ) -> Option<AppEvent> {
+        match event {
+            Event::WindowEvent { event: win_ev, .. } => {
+                translate_window_event(win_ev, tracker)
+            }
+            _ => None,
+        }
+    }
+
+    fn translate_window_event(
+        win_ev: &WindowEvent,
+        tracker: &mut ModifierTracker,
+    ) -> Option<AppEvent> {
+        match win_ev {
+            WindowEvent::CloseRequested => Some(AppEvent::Quit),
+
+            WindowEvent::Resized(size) => {
+                Some(AppEvent::Resize(size.width as u16, size.height as u16))
+            }
+
+            WindowEvent::Focused(focused) => {
+                if *focused {
+                    Some(AppEvent::FocusGained)
+                } else {
+                    Some(AppEvent::FocusLost)
+                }
+            }
+
+            WindowEvent::ModifiersChanged(mods) => {
+                tracker.update(mods.state());
+                None // modifier changes are state, not actions
+            }
+
+            WindowEvent::KeyboardInput { event, .. } => {
+                let mut mods = tracker.to_app_modifiers();
+
+                // Fallback: if the tracker hasn't seen a ModifiersChanged
+                // event yet (which can happen on the very first key press
+                // on some X11/Wayland compositors), infer shift from the
+                // character's case. winit sends `Key::Character("T")` when
+                // shift is held, so an uppercase letter implies shift.
+                // This catches the common Ctrl+Shift+<letter> hotkeys even
+                // when modifier tracking hasn't warmed up.
+                if !mods.shift {
+                    if let winit::keyboard::Key::Character(s) = &event.logical_key {
+                        if s.chars().next().map(|c| c.is_ascii_uppercase()).unwrap_or(false) {
+                            mods.shift = true;
+                        }
+                    }
+                }
+
+                winit_key_to_app_key(event, mods).map(AppEvent::Key)
+            }
+
+            _ => None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

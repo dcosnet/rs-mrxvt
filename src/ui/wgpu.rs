@@ -43,6 +43,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use winit::event_loop::EventLoop;
+use winit::platform::pump_events::{EventLoopExtPumpEvents, PumpStatus};
 use winit::window::WindowBuilder;
 
 use alacritty_terminal::grid::Dimensions;
@@ -53,6 +54,7 @@ use alacritty_terminal::vte::ansi::{Color as AnsiColor, NamedColor};
 use wgpu::util::DeviceExt;
 
 use crate::app::App;
+use crate::terminal::manager::BroadcastTarget;
 use crate::ui::backend::BackendFactory;
 use crate::ui::glyph::GlyphCache;
 use crate::ui::shaders::SHADER_SOURCE;
@@ -62,13 +64,54 @@ const CELL_WIDTH: u32 = 8;
 const CELL_HEIGHT: u32 = 16;
 const FONT_PIXEL_SIZE: f32 = 14.0;
 const ATLAS_SIZE: u32 = 1024;
+/// Padding between glyphs in the atlas (pixels). Prevents linear-filter
+/// sampling from bleeding into neighbouring glyphs at the edges.
+const ATLAS_PADDING: u32 = 1;
+
+/// Height of the tab bar in pixels (one cell row).
+const TAB_BAR_HEIGHT: u32 = CELL_HEIGHT;
+/// Height of the status bar in pixels (one cell row). Documented here for
+/// layout clarity; the status bar Y is computed from `total_rows` at render
+/// time, but this constant keeps the chrome-height intent explicit.
+#[allow(dead_code)]
+const STATUS_BAR_HEIGHT: u32 = CELL_HEIGHT;
+
+// ─── Modern color palette (linear RGB, 0..1) ─────────────────────────────
+//
+// A clean dark theme with a cyan accent — modern without being garish.
+const COLOR_BG: [f32; 4] = [0.05, 0.05, 0.07, 1.0];          // window background
+const COLOR_TABBAR_BG: [f32; 4] = [0.10, 0.10, 0.13, 1.0];   // tab bar bg
+const COLOR_TAB_INACTIVE_BG: [f32; 4] = [0.12, 0.12, 0.16, 1.0];
+const COLOR_TAB_INACTIVE_FG: [f32; 4] = [0.55, 0.55, 0.62, 1.0];
+const COLOR_TAB_ACTIVE_BG: [f32; 4] = [0.15, 0.20, 0.28, 1.0]; // highlighted
+#[allow(dead_code)]
+const COLOR_TAB_ACTIVE_FG: [f32; 4] = [0.95, 0.95, 1.0, 1.0];
+const COLOR_TAB_ACCENT: [f32; 4] = [0.20, 0.65, 0.85, 1.0];  // cyan accent (active tab indicator)
+#[allow(dead_code)]
+const COLOR_TAB_SEPARATOR: [f32; 4] = [0.20, 0.20, 0.25, 1.0];
+const COLOR_STATUS_BG: [f32; 4] = [0.08, 0.08, 0.11, 1.0];
+const COLOR_STATUS_FG: [f32; 4] = [0.60, 0.60, 0.67, 1.0];
+const COLOR_BROADCAST_ALL: [f32; 4] = [0.90, 0.25, 0.25, 1.0]; // red
+const COLOR_BROADCAST_GROUP: [f32; 4] = [0.85, 0.40, 0.85, 1.0]; // magenta
 
 /// Per-cell instance data. Matches the `VertexInput` struct in the WGSL shader.
+///
+/// The quad covers the full cell (for the background fill). The glyph is
+/// positioned within the cell via `glyph_offset` and `glyph_size` so it
+/// renders at its natural aspect ratio instead of being stretched to fill
+/// the cell. The atlas UV rect (`uv_offset`, `uv_size`) maps to the glyph's
+/// actual pixels in the atlas.
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 struct CellInstance {
     position: [f32; 2],
     size: [f32; 2],
+    /// Top-left of the glyph rect within the cell, in pixels relative to
+    /// the cell's top-left. Used to position the glyph at the right baseline.
+    glyph_offset: [f32; 2],
+    /// Size of the glyph rect in pixels. The shader uses this to determine
+    /// whether a fragment falls inside the glyph.
+    glyph_size: [f32; 2],
     uv_offset: [f32; 2],
     uv_size: [f32; 2],
     bg_color: [f32; 4],
@@ -77,14 +120,16 @@ struct CellInstance {
 }
 
 impl CellInstance {
-    const ATTRS: [wgpu::VertexAttribute; 7] = wgpu::vertex_attr_array![
-        0 => Float32x2,
-        1 => Float32x2,
-        2 => Float32x2,
-        3 => Float32x2,
-        4 => Float32x4,
-        5 => Float32x4,
-        6 => Uint32,
+    const ATTRS: [wgpu::VertexAttribute; 9] = wgpu::vertex_attr_array![
+        0 => Float32x2,  // position
+        1 => Float32x2,  // size
+        2 => Float32x2,  // glyph_offset
+        3 => Float32x2,  // glyph_size
+        4 => Float32x2,  // uv_offset
+        5 => Float32x2,  // uv_size
+        6 => Float32x4,  // bg_color
+        7 => Float32x4,  // fg_color
+        8 => Uint32,     // flags
     ];
 
     fn desc() -> wgpu::VertexBufferLayout<'static> {
@@ -106,6 +151,13 @@ struct Uniforms {
 
 pub struct WgpuRenderer {
     window: Arc<winit::window::Window>,
+    /// The winit event loop. Must be kept alive and pumped every tick —
+    /// without pumping, the window never receives configure/expose events
+    /// and appears as a blank form. winit's `pump_events` lets us drive it
+    /// from our own main loop instead of ceding control to `EventLoop::run`.
+    event_loop: EventLoop<()>,
+    /// Tracks keyboard modifier state (updated by ModifiersChanged events).
+    mod_tracker: crate::ui::event::winit_translate::ModifierTracker,
     surface: wgpu::Surface<'static>,
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -122,8 +174,21 @@ pub struct WgpuRenderer {
     /// Tracks how many glyphs are currently in the atlas. If this changes
     /// between frames, we re-upload the texture.
     cached_glyph_count: usize,
+    /// Maps each cached glyph (char, bold, italic) to its pixel rect in the
+    /// atlas. Built lazily by `rebuild_atlas` when new glyphs appear.
+    /// Keyed the same way as `GlyphCache`'s internal map.
+    atlas_map: std::collections::HashMap<(char, bool, bool), AtlasRect>,
     pending_events: Vec<crate::ui::event::AppEvent>,
     start_time: std::time::Instant,
+}
+
+/// A glyph's placement in the atlas texture (pixel coordinates).
+#[derive(Copy, Clone, Debug)]
+struct AtlasRect {
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
 }
 
 impl WgpuRenderer {
@@ -133,6 +198,12 @@ impl WgpuRenderer {
         let window = Arc::new(
             WindowBuilder::new()
                 .with_title("rs-mrxvt")
+                // Give the window a real initial size. Without this, the WM
+                // may pick a tiny default (sometimes 1×1 or just title-bar-
+                // tall), which leaves the surface too small to render any
+                // cells and the user sees a blank form. 1024×768 is a
+                // conservative default that every compositor will honour.
+                .with_inner_size(winit::dpi::LogicalSize::<u32>::new(1024, 768))
                 .build(&event_loop)
                 .map_err(|e| anyhow::anyhow!("creating winit window: {e}"))?,
         );
@@ -344,7 +415,15 @@ impl WgpuRenderer {
                 })],
                 compilation_options: Default::default(),
             }),
-            primitive: wgpu::PrimitiveState::default(),
+            primitive: wgpu::PrimitiveState {
+                // TriangleStrip: 4 vertices → 2 triangles forming one quad.
+                // The default (TriangleList) would need 6 vertices for a quad
+                // and would drop the 4th vertex, leaving half of every glyph
+                // unrendered. The vertex shader's corner mapping
+                // (vid 0..3 → TL,TR,BL,BR) is designed for strip order.
+                topology: wgpu::PrimitiveTopology::TriangleStrip,
+                ..Default::default()
+            },
             depth_stencil: None,
             multisample: wgpu::MultisampleState::default(),
             multiview: None,
@@ -355,6 +434,8 @@ impl WgpuRenderer {
 
         Ok(Self {
             window,
+            event_loop,
+            mod_tracker: Default::default(),
             surface,
             device,
             queue,
@@ -367,90 +448,328 @@ impl WgpuRenderer {
             glyph_atlas_view,
             glyph_sampler,
             cached_glyph_count: 0,
+            atlas_map: std::collections::HashMap::new(),
             pending_events: Vec::new(),
             start_time: std::time::Instant::now(),
         })
     }
 
-    /// Build the instance buffer for one frame: one CellInstance per visible cell.
+    /// Build the full instance buffer for one frame: tab bar + terminal grid
+    /// + status bar.
+    ///
+    /// All three are rendered with the same instanced quad pipeline — each
+    /// character is just another cell instance.
     fn build_instances(&mut self, app: &App) -> Vec<CellInstance> {
         let manager = &app.manager;
         let active_idx = manager.active;
-        let tab = match manager.tabs.get(active_idx) {
-            Some(t) => t,
-            None => return Vec::new(),
-        };
 
-        let grid = tab.term.grid();
         let cols = (self.config.width / CELL_WIDTH) as usize;
-        let rows = (self.config.height / CELL_HEIGHT) as usize;
-        let screen_lines = grid.screen_lines();
-        let display_offset = grid.display_offset();
-        let start_line = -(display_offset as i32);
-        let render_rows = rows.min(screen_lines);
+        let total_rows = (self.config.height / CELL_HEIGHT) as usize;
+        // Terminal area = total minus tab bar (top) and status bar (bottom).
+        let term_rows = total_rows.saturating_sub(2);
 
-        let mut instances = Vec::with_capacity(cols * render_rows);
+        let mut instances = Vec::with_capacity(cols * total_rows);
 
-        for row_idx in 0..render_rows as i32 {
-            let line = ALine(start_line + row_idx);
-            for col_idx in 0..cols {
-                let point = Point { line, column: Column(col_idx) };
-                let cell: &Cell = &grid[point];
+        // ── Tab bar (row 0) ──────────────────────────────────────────────
+        instances.extend(self.build_tab_bar_instances(app, cols));
 
-                let bg = ansi_to_linear(cell.bg);
-                let fg = ansi_to_linear(cell.fg);
+        // ── Terminal grid (rows 1..=term_rows) ───────────────────────────
+        if let Some(tab) = manager.tabs.get(active_idx) {
+            let grid = tab.term.grid();
+            let screen_lines = grid.screen_lines();
+            let display_offset = grid.display_offset();
+            let start_line = -(display_offset as i32);
+            let render_rows = term_rows.min(screen_lines);
 
-                let has_glyph = cell.c != ' ' && cell.c != '\0';
+            for row_idx in 0..render_rows as i32 {
+                let line = ALine(start_line + row_idx);
+                for col_idx in 0..cols {
+                    let point = Point { line, column: Column(col_idx) };
+                    let cell: &Cell = &grid[point];
+
+                    let bg = ansi_to_linear(cell.bg);
+                    let fg = ansi_to_linear(cell.fg);
+
+                    let bold = cell.flags.contains(CellFlags::BOLD);
+                    let italic = cell.flags.contains(CellFlags::ITALIC);
+                    let has_glyph = cell.c != ' ' && cell.c != '\0';
+
+                    let mut flags = 0u32;
+                    if has_glyph {
+                        flags |= 1;
+                    }
+                    if bold {
+                        flags |= 2;
+                    }
+                    if italic {
+                        flags |= 4;
+                    }
+
+                    let (uv_offset, uv_size, glyph_offset, glyph_size) = if has_glyph {
+                        let g = self.glyph_cache.get(cell.c, bold, italic);
+                        match self.atlas_map.get(&(cell.c, bold, italic)) {
+                            Some(rect) if rect.w > 0 && rect.h > 0 => {
+                                let baseline = CELL_HEIGHT as f32 - 3.0;
+                                let gx = g.bearing_x.max(0.0);
+                                let gy = (baseline + g.bearing_y).max(0.0);
+                                (
+                                    [
+                                        rect.x as f32 / ATLAS_SIZE as f32,
+                                        rect.y as f32 / ATLAS_SIZE as f32,
+                                    ],
+                                    [
+                                        rect.w as f32 / ATLAS_SIZE as f32,
+                                        rect.h as f32 / ATLAS_SIZE as f32,
+                                    ],
+                                    [gx, gy],
+                                    [rect.w as f32, rect.h as f32],
+                                )
+                            }
+                            _ => ([0.0, 0.0], [0.0, 0.0], [0.0, 0.0], [0.0, 0.0]),
+                        }
+                    } else {
+                        ([0.0, 0.0], [0.0, 0.0], [0.0, 0.0], [0.0, 0.0])
+                    };
+
+                    // Offset by TAB_BAR_HEIGHT so the grid starts below the
+                    // tab bar.
+                    let y = (row_idx as u32 * CELL_HEIGHT + TAB_BAR_HEIGHT) as f32;
+                    instances.push(CellInstance {
+                        position: [(col_idx as u32 * CELL_WIDTH) as f32, y],
+                        size: [CELL_WIDTH as f32, CELL_HEIGHT as f32],
+                        glyph_offset,
+                        glyph_size,
+                        uv_offset,
+                        uv_size,
+                        bg_color: bg,
+                        fg_color: fg,
+                        flags,
+                    });
+                }
+            }
+        }
+
+        // ── Status bar (bottom row) ──────────────────────────────────────
+        instances.extend(self.build_status_bar_instances(app, cols, total_rows));
+
+        instances
+    }
+
+    /// Build the tab bar instances: one row of cells at the top of the
+    /// window showing each tab's index and title, with the active tab
+    /// highlighted. Uses the same instanced-quad pipeline as the grid.
+    fn build_tab_bar_instances(&mut self, app: &App, cols: usize) -> Vec<CellInstance> {
+        let manager = &app.manager;
+        let active_idx = manager.active;
+        let total_cols = cols;
+
+        // Start with the tab bar background — fill the entire row.
+        let mut instances: Vec<CellInstance> = Vec::with_capacity(total_cols);
+        for col_idx in 0..total_cols {
+            instances.push(CellInstance {
+                position: [(col_idx as u32 * CELL_WIDTH) as f32, 0.0],
+                size: [CELL_WIDTH as f32, CELL_HEIGHT as f32],
+                glyph_offset: [0.0, 0.0],
+                glyph_size: [0.0, 0.0],
+                uv_offset: [0.0, 0.0],
+                uv_size: [0.0, 0.0],
+                bg_color: COLOR_TABBAR_BG,
+                fg_color: COLOR_TAB_INACTIVE_FG,
+                flags: 0,
+            });
+        }
+
+        // Render each tab's title starting at column 1 (leave 1-col margin).
+        let mut col: usize = 1;
+        for (i, tab) in manager.tabs.iter().enumerate() {
+            let is_active = i == active_idx;
+
+            // Build the tab label: " N: title " (space, index, colon, title, space)
+            let tag_str = tab.tag.as_ref().map(|g| format!(" [{}]", g)).unwrap_or_default();
+            let label = format!(" {}: {}{} ", i + 1, tab.title, tag_str);
+
+            let bg = if is_active { COLOR_TAB_ACTIVE_BG } else { COLOR_TAB_INACTIVE_BG };
+            // Active tab uses the cyan accent color for its text to make it
+            // stand out; inactive tabs use a muted gray.
+            let fg = if is_active { COLOR_TAB_ACCENT } else { COLOR_TAB_INACTIVE_FG };
+
+            for ch in label.chars() {
+                if col >= total_cols {
+                    break;
+                }
+
+                let has_glyph = ch != ' ';
                 let mut flags = 0u32;
                 if has_glyph {
                     flags |= 1;
                 }
-                if cell.flags.contains(CellFlags::BOLD) {
-                    flags |= 2;
-                }
-                if cell.flags.contains(CellFlags::ITALIC) {
-                    flags |= 4;
+                if is_active {
+                    flags |= 2; // bold for active tab
                 }
 
-                // For the atlas UV: we use a simple layout where each glyph
-                // occupies a fixed-size slot. This is suboptimal (wastes
-                // space) but simple. A future version can pack more tightly.
-                let (uv_offset, uv_size) = if has_glyph {
-                    // Force-rasterize to ensure the glyph is in the cache.
-                    self.glyph_cache.get(cell.c, flags & 2 != 0, flags & 4 != 0);
-                    // Each glyph gets a CELL_WIDTH x CELL_HEIGHT slot in the atlas.
-                    // We index by the char's Unicode scalar value mod (ATLAS_SIZE / CELL_WIDTH).
-                    let slot_w = ATLAS_SIZE / CELL_WIDTH;
-                    let slot_h = ATLAS_SIZE / CELL_HEIGHT;
-                    let char_idx = cell.c as u32;
-                    let sx = (char_idx % slot_w) * CELL_WIDTH;
-                    let sy = ((char_idx / slot_w) % slot_h) * CELL_HEIGHT;
-                    (
-                        [sx as f32 / ATLAS_SIZE as f32, sy as f32 / ATLAS_SIZE as f32],
-                        [CELL_WIDTH as f32 / ATLAS_SIZE as f32, CELL_HEIGHT as f32 / ATLAS_SIZE as f32],
-                    )
+                let (uv_offset, uv_size, glyph_offset, glyph_size) = if has_glyph {
+                    let bold = is_active; // active tab is bold
+                    let g = self.glyph_cache.get(ch, bold, false);
+                    match self.atlas_map.get(&(ch, bold, false)) {
+                        Some(rect) if rect.w > 0 && rect.h > 0 => {
+                            let baseline = CELL_HEIGHT as f32 - 3.0;
+                            let gx = g.bearing_x.max(0.0);
+                            let gy = (baseline + g.bearing_y).max(0.0);
+                            (
+                                [
+                                    rect.x as f32 / ATLAS_SIZE as f32,
+                                    rect.y as f32 / ATLAS_SIZE as f32,
+                                ],
+                                [
+                                    rect.w as f32 / ATLAS_SIZE as f32,
+                                    rect.h as f32 / ATLAS_SIZE as f32,
+                                ],
+                                [gx, gy],
+                                [rect.w as f32, rect.h as f32],
+                            )
+                        }
+                        _ => ([0.0, 0.0], [0.0, 0.0], [0.0, 0.0], [0.0, 0.0]),
+                    }
                 } else {
-                    ([0.0, 0.0], [0.0, 0.0])
+                    ([0.0, 0.0], [0.0, 0.0], [0.0, 0.0], [0.0, 0.0])
                 };
 
-                instances.push(CellInstance {
-                    position: [(col_idx as u32 * CELL_WIDTH) as f32, (row_idx as u32 * CELL_HEIGHT) as f32],
+                // Overwrite the background instance at this column.
+                instances[col] = CellInstance {
+                    position: [(col as u32 * CELL_WIDTH) as f32, 0.0],
                     size: [CELL_WIDTH as f32, CELL_HEIGHT as f32],
+                    glyph_offset,
+                    glyph_size,
                     uv_offset,
                     uv_size,
                     bg_color: bg,
                     fg_color: fg,
                     flags,
-                });
+                };
+                col += 1;
+            }
+
+            // Separator between tabs (a thin dim column).
+            if col < total_cols && i < manager.tabs.len() - 1 {
+                instances[col] = CellInstance {
+                    position: [(col as u32 * CELL_WIDTH) as f32, 0.0],
+                    size: [CELL_WIDTH as f32, CELL_HEIGHT as f32],
+                    glyph_offset: [0.0, 0.0],
+                    glyph_size: [0.0, 0.0],
+                    uv_offset: [0.0, 0.0],
+                    uv_size: [0.0, 0.0],
+                    bg_color: COLOR_TAB_SEPARATOR,
+                    fg_color: COLOR_TAB_SEPARATOR,
+                    flags: 0,
+                };
+                col += 1;
             }
         }
 
         instances
     }
 
+    /// Build the status bar instances: broadcast indicator, tab count,
+    /// active tab index. Rendered as the bottom row of the window.
+    fn build_status_bar_instances(&mut self, app: &App, cols: usize, total_rows: usize) -> Vec<CellInstance> {
+        let manager = &app.manager;
+        let active_idx = manager.active;
+        let y = (total_rows.saturating_sub(1) as u32 * CELL_HEIGHT) as f32;
+
+        // Build the status text.
+        let (status_text, text_color) = match &manager.broadcast {
+            BroadcastTarget::Active => (
+                format!(" rs-mrxvt  |  tabs={}  active={}/{}  ", manager.tabs.len(), active_idx + 1, manager.tabs.len()),
+                COLOR_STATUS_FG,
+            ),
+            BroadcastTarget::All => (
+                format!(" BROADCAST:ALL  |  tabs={}  ", manager.tabs.len()),
+                COLOR_BROADCAST_ALL,
+            ),
+            BroadcastTarget::Group(g) => (
+                format!(" BROADCAST:{}  |  tabs={}  ", g, manager.tabs.len()),
+                COLOR_BROADCAST_GROUP,
+            ),
+        };
+
+        let mut instances: Vec<CellInstance> = Vec::with_capacity(cols);
+
+        // Fill the status bar background.
+        for col_idx in 0..cols {
+            instances.push(CellInstance {
+                position: [(col_idx as u32 * CELL_WIDTH) as f32, y],
+                size: [CELL_WIDTH as f32, CELL_HEIGHT as f32],
+                glyph_offset: [0.0, 0.0],
+                glyph_size: [0.0, 0.0],
+                uv_offset: [0.0, 0.0],
+                uv_size: [0.0, 0.0],
+                bg_color: COLOR_STATUS_BG,
+                fg_color: text_color,
+                flags: 0,
+            });
+        }
+
+        // Render the status text over the background.
+        for (col, ch) in status_text.chars().enumerate() {
+            if col >= cols {
+                break;
+            }
+
+            let has_glyph = ch != ' ';
+            let mut flags = 0u32;
+            if has_glyph {
+                flags |= 1;
+            }
+
+            let (uv_offset, uv_size, glyph_offset, glyph_size) = if has_glyph {
+                let g = self.glyph_cache.get(ch, false, false);
+                match self.atlas_map.get(&(ch, false, false)) {
+                    Some(rect) if rect.w > 0 && rect.h > 0 => {
+                        let baseline = CELL_HEIGHT as f32 - 3.0;
+                        let gx = g.bearing_x.max(0.0);
+                        let gy = (baseline + g.bearing_y).max(0.0);
+                        (
+                            [
+                                rect.x as f32 / ATLAS_SIZE as f32,
+                                rect.y as f32 / ATLAS_SIZE as f32,
+                            ],
+                            [
+                                rect.w as f32 / ATLAS_SIZE as f32,
+                                rect.h as f32 / ATLAS_SIZE as f32,
+                            ],
+                            [gx, gy],
+                            [rect.w as f32, rect.h as f32],
+                        )
+                    }
+                    _ => ([0.0, 0.0], [0.0, 0.0], [0.0, 0.0], [0.0, 0.0]),
+                }
+            } else {
+                ([0.0, 0.0], [0.0, 0.0], [0.0, 0.0], [0.0, 0.0])
+            };
+
+            instances[col] = CellInstance {
+                position: [(col as u32 * CELL_WIDTH) as f32, y],
+                size: [CELL_WIDTH as f32, CELL_HEIGHT as f32],
+                glyph_offset,
+                glyph_size,
+                uv_offset,
+                uv_size,
+                bg_color: COLOR_STATUS_BG,
+                fg_color: text_color,
+                flags,
+            };
+        }
+
+        instances
+    }
+
     /// If new glyphs have been rasterized since the last upload, re-upload
-    /// the atlas texture. This is O(glyph_count) per upload; we only upload
-    /// when the count changed.
+    /// the atlas texture with all cached glyphs packed in. Rebuilds
+    /// `atlas_map` so `build_instances` can find each glyph's UV rect.
+    ///
+    /// Uses a simple row-based shelf packing: glyphs are placed left-to-right
+    /// in the current row; when a glyph won't fit, move to the next row.
+    /// This is O(glyph_count) and only runs when the cache grows.
     fn maybe_upload_atlas(&mut self) {
         let count = self.glyph_cache.len();
         if count == self.cached_glyph_count {
@@ -458,39 +777,71 @@ impl WgpuRenderer {
         }
         self.cached_glyph_count = count;
 
-        // Build the atlas as a single R8 buffer. For simplicity, we use the
-        // fixed-slot layout: glyph for char C lives at
-        // (C % slot_w) * CELL_WIDTH, (C / slot_w) % slot_h) * CELL_HEIGHT.
+        // Clear the atlas and the map — we rebuild both from scratch.
         let mut atlas = vec![0u8; (ATLAS_SIZE * ATLAS_SIZE) as usize];
+        self.atlas_map.clear();
 
-        // We don't have direct access to the cache's internals here, so we
-        // re-rasterize every glyph into the atlas. This is wasteful but
-        // correct; a future version will expose an iterator over the cache.
-        // For the MVP, this only runs when the cache size changes (rare).
-        for codepoint in 0u32..0x80 {
-            // Only ASCII for the MVP; full Unicode would iterate the cache.
-            let c = char::from_u32(codepoint).unwrap_or('?');
-            if c == ' ' || c == '\0' {
+        // Shelf-packing state.
+        let mut cur_x: u32 = 0;
+        let mut cur_y: u32 = 0;
+        let mut row_height: u32 = 0;
+
+        // Iterate every cached glyph and blit it into the atlas.
+        for ((c, bold, italic), g) in self.glyph_cache.iter() {
+            let gw = g.width as u32;
+            let gh = g.height as u32;
+
+            // Skip empty glyphs (e.g. spaces, missing outlines). We still
+            // record a zero-size rect so build_instances can look them up
+            // without re-triggering the cache check.
+            if gw == 0 || gh == 0 {
+                self.atlas_map.insert((c, bold, italic), AtlasRect { x: 0, y: 0, w: 0, h: 0 });
                 continue;
             }
-            let g = self.glyph_cache.get(c, false, false);
-            let slot_w = ATLAS_SIZE / CELL_WIDTH;
-            let sx = (codepoint % slot_w) * CELL_WIDTH;
-            let sy = ((codepoint / slot_w) % (ATLAS_SIZE / CELL_HEIGHT)) * CELL_HEIGHT;
 
-            for gy in 0..g.height {
-                for gx in 0..g.width {
-                    let px = sx as usize + gx;
-                    let py = sy as usize + gy;
-                    if px < ATLAS_SIZE as usize && py < ATLAS_SIZE as usize {
-                        let gidx = (gy * g.width + gx) * 4 + 3; // alpha channel
-                        let alpha = g.pixels[gidx];
-                        let aidx = py * ATLAS_SIZE as usize + px;
-                        atlas[aidx] = alpha;
-                    }
+            let padded_w = gw + ATLAS_PADDING;
+            let padded_h = gh + ATLAS_PADDING;
+
+            // Does it fit on the current row?
+            if cur_x + padded_w > ATLAS_SIZE {
+                // Move to the next row.
+                cur_y += row_height;
+                cur_x = 0;
+                row_height = 0;
+            }
+
+            // Does it fit vertically? If not, the atlas is full. Skip the
+            // glyph (it won't render, but we won't crash).
+            if cur_y + padded_h > ATLAS_SIZE {
+                log::warn!("glyph atlas full ({}x{}); skipping glyph {:?}", ATLAS_SIZE, ATLAS_SIZE, c);
+                self.atlas_map.insert((c, bold, italic), AtlasRect { x: 0, y: 0, w: 0, h: 0 });
+                continue;
+            }
+
+            let rect = AtlasRect { x: cur_x, y: cur_y, w: gw, h: gh };
+            self.atlas_map.insert((c, bold, italic), rect);
+
+            // Blit the glyph's alpha channel into the atlas.
+            for gy in 0..gh {
+                for gx in 0..gw {
+                    let px = (cur_x + gx) as usize;
+                    let py = (cur_y + gy) as usize;
+                    let gidx = (gy as usize * gw as usize + gx as usize) * 4 + 3;
+                    let alpha = g.pixels[gidx];
+                    let aidx = py * ATLAS_SIZE as usize + px;
+                    atlas[aidx] = alpha;
                 }
             }
+
+            cur_x += padded_w;
+            row_height = row_height.max(padded_h);
         }
+
+        log::debug!(
+            "atlas rebuilt: {} glyphs, packed to row y={}",
+            self.atlas_map.len(),
+            cur_y + row_height
+        );
 
         self.queue.write_texture(
             wgpu::ImageCopyTexture {
@@ -516,6 +867,31 @@ impl WgpuRenderer {
 
 impl Renderer for WgpuRenderer {
     fn init(&mut self) -> Result<()> {
+        // Pump the event loop briefly so the window receives its initial
+        // configure event and gets mapped by the compositor. Without this,
+        // the first render() call may run before the surface is ready
+        // (especially on Wayland), causing get_current_texture to fail.
+        let mut tracker = self.mod_tracker;
+        let _ = self.event_loop.pump_events(
+            Some(std::time::Duration::from_millis(50)),
+            |event, elwt| {
+                let _ = crate::ui::event::winit_translate::translate_event(
+                    &event, &mut tracker, elwt,
+                );
+            },
+        );
+        self.mod_tracker = tracker;
+
+        // Now that the window has its initial size, configure the surface
+        // to match. This avoids a wasted first frame.
+        let size = self.window.inner_size();
+        if size.width > 0 && size.height > 0 {
+            self.config.width = size.width;
+            self.config.height = size.height;
+            self.surface.configure(&self.device, &self.config);
+            log::debug!("wgpu surface configured on init: {}x{}", size.width, size.height);
+        }
+
         Ok(())
     }
 
@@ -523,26 +899,62 @@ impl Renderer for WgpuRenderer {
         Ok(())
     }
 
-    fn poll_event(&mut self, _timeout_ms: u64) -> Result<Option<crate::ui::event::AppEvent>> {
-        // winit event loop integration is deferred (see soft.rs for the same
-        // caveat). For now we return None; the user can close the window
-        // via the WM.
-        if self.pending_events.is_empty() {
+    fn poll_event(&mut self, timeout_ms: u64) -> Result<Option<crate::ui::event::AppEvent>> {
+        // If we have buffered events from a previous pump, return the oldest.
+        if !self.pending_events.is_empty() {
+            return Ok(self.pending_events.drain(..).next());
+        }
+
+        // Pump the winit event loop. This processes window events (resize,
+        // keyboard, mouse, close) for up to `timeout_ms`, translating each
+        // into an `AppEvent` via the winit_translate module. Without this
+        // pump call, the window never gets its initial configure event and
+        // appears as a blank form.
+        //
+        // We collect into a local Vec because `pump_events` borrows
+        // `self.event_loop` mutably, preventing the closure from capturing
+        // `self.pending_events` directly.
+        let mut collected: Vec<crate::ui::event::AppEvent> = Vec::new();
+        let mut tracker = self.mod_tracker;
+        let timeout = Some(std::time::Duration::from_millis(timeout_ms));
+
+        let status = self.event_loop.pump_events(timeout, |event, elwt| {
+            if let Some(app_ev) = crate::ui::event::winit_translate::translate_event(
+                &event, &mut tracker, elwt,
+            ) {
+                collected.push(app_ev);
+            }
+        });
+
+        self.mod_tracker = tracker;
+
+        // If the event loop is exiting (window close button, etc.), signal quit.
+        if let PumpStatus::Exit(_) = status {
+            collected.push(crate::ui::event::AppEvent::Quit);
+        }
+
+        // Return the first event, if any. The rest stay buffered for next call.
+        if collected.is_empty() {
             Ok(None)
         } else {
-            Ok(self.pending_events.drain(..).next())
+            let first = collected.remove(0);
+            self.pending_events.extend(collected);
+            Ok(Some(first))
         }
     }
 
     fn render(&mut self, app: &mut App) -> Result<()> {
-        // Resize surface if the window changed.
+        // Resize surface if the window changed. We also force a reconfigure
+        // when width/height are still 0 (first frame, or the WM hasn't sent
+        // the initial configure event yet — rare but possible on Wayland).
         let size = self.window.inner_size();
-        if size.width > 0 && size.height > 0
-            && (size.width != self.config.width || size.height != self.config.height)
-        {
+        let needs_configure = size.width > 0 && size.height > 0
+            && (size.width != self.config.width || size.height != self.config.height);
+        if needs_configure {
             self.config.width = size.width;
             self.config.height = size.height;
             self.surface.configure(&self.device, &self.config);
+            log::debug!("wgpu surface reconfigured to {}x{}", size.width, size.height);
         }
 
         // Update uniforms.
@@ -571,7 +983,12 @@ impl Renderer for WgpuRenderer {
         let output = match self.surface.get_current_texture() {
             Ok(t) => t,
             Err(e) => {
-                log::debug!("get_current_texture failed, skipping frame: {e}");
+                // This happens when the surface hasn't been configured yet
+                // (first frame on Wayland, before the initial configure event)
+                // or after the window is minimized. Re-configure on next tick
+                // and skip this frame. Log at info level the first time so the
+                // user can see what's happening if they're watching logs.
+                log::info!("get_current_texture failed (will retry): {e}");
                 return Ok(());
             }
         };
@@ -590,10 +1007,10 @@ impl Renderer for WgpuRenderer {
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.02,
-                            g: 0.04,
-                            b: 0.02,
-                            a: 1.0,
+                            r: COLOR_BG[0] as f64,
+                            g: COLOR_BG[1] as f64,
+                            b: COLOR_BG[2] as f64,
+                            a: COLOR_BG[3] as f64,
                         }),
                         store: wgpu::StoreOp::Store,
                     },
@@ -618,9 +1035,16 @@ impl Renderer for WgpuRenderer {
     }
 
     fn size(&self) -> (u16, u16) {
+        // The wgpu renderer draws a tab bar at the top and a status bar at
+        // the bottom, each one cell row tall. The terminal grid gets the
+        // space between them. The PTY is told exactly how many rows fit in
+        // the terminal area so the shell's line wrapping matches what's
+        // on screen.
         let cols = (self.config.width / CELL_WIDTH).max(2) as u16;
-        let rows = (self.config.height / CELL_HEIGHT).saturating_sub(2).max(1) as u16;
-        (cols, rows)
+        let total_rows = self.config.height / CELL_HEIGHT;
+        // Subtract 2 rows: tab bar (top) + status bar (bottom).
+        let term_rows = total_rows.saturating_sub(2).max(1) as u16;
+        (cols, term_rows)
     }
 }
 

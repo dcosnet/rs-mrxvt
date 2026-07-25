@@ -45,6 +45,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use winit::event_loop::EventLoop;
+use winit::platform::pump_events::{EventLoopExtPumpEvents, PumpStatus};
 use winit::window::WindowBuilder;
 
 use alacritty_terminal::grid::Dimensions;
@@ -66,6 +67,13 @@ const FONT_PIXEL_SIZE: f32 = 14.0;
 /// CPU-rasterized renderer.
 pub struct SoftRenderer {
     window: Arc<winit::window::Window>,
+    /// The winit event loop. Must be kept alive and pumped every tick —
+    /// without pumping, the window never receives configure/expose events
+    /// and appears as a blank form. winit's `pump_events` lets us drive it
+    /// from our own main loop instead of ceding control to `EventLoop::run`.
+    event_loop: EventLoop<()>,
+    /// Tracks keyboard modifier state (updated by ModifiersChanged events).
+    mod_tracker: crate::ui::event::winit_translate::ModifierTracker,
     #[allow(dead_code)]
     context: softbuffer::Context<Arc<winit::window::Window>>,
     surface: softbuffer::Surface<Arc<winit::window::Window>, Arc<winit::window::Window>>,
@@ -80,6 +88,11 @@ impl SoftRenderer {
         let window = Arc::new(
             WindowBuilder::new()
                 .with_title("rs-mrxvt (softbuffer)")
+                // Give the window a real initial size. Without this, the WM
+                // may pick a tiny default (sometimes 1×1 or just title-bar-
+                // tall), which leaves the surface too small to render any
+                // cells and the user sees a blank form.
+                .with_inner_size(winit::dpi::LogicalSize::<u32>::new(1024, 768))
                 .build(&event_loop)
                 .map_err(|e| anyhow::anyhow!("creating winit window: {e}"))?,
         );
@@ -101,6 +114,8 @@ impl SoftRenderer {
 
         Ok(Self {
             window,
+            event_loop,
+            mod_tracker: Default::default(),
             context,
             surface,
             glyph_cache,
@@ -118,12 +133,41 @@ impl Renderer for SoftRenderer {
         Ok(())
     }
 
-    fn poll_event(&mut self, _timeout_ms: u64) -> Result<Option<crate::ui::event::AppEvent>> {
-        // Same caveat as WgpuRenderer: winit event loop integration is deferred.
-        if self.pending_events.is_empty() {
+    fn poll_event(&mut self, timeout_ms: u64) -> Result<Option<crate::ui::event::AppEvent>> {
+        // If we have buffered events from a previous pump, return the oldest.
+        if !self.pending_events.is_empty() {
+            return Ok(self.pending_events.drain(..).next());
+        }
+
+        // Pump the winit event loop. This processes window events (resize,
+        // keyboard, mouse, close) for up to `timeout_ms`, translating each
+        // into an `AppEvent` via the winit_translate module. Without this
+        // pump call, the window never gets its initial configure event and
+        // appears as a blank form.
+        let mut collected: Vec<crate::ui::event::AppEvent> = Vec::new();
+        let mut tracker = self.mod_tracker;
+        let timeout = Some(std::time::Duration::from_millis(timeout_ms));
+
+        let status = self.event_loop.pump_events(timeout, |event, elwt| {
+            if let Some(app_ev) = crate::ui::event::winit_translate::translate_event(
+                &event, &mut tracker, elwt,
+            ) {
+                collected.push(app_ev);
+            }
+        });
+
+        self.mod_tracker = tracker;
+
+        if let PumpStatus::Exit(_) = status {
+            collected.push(crate::ui::event::AppEvent::Quit);
+        }
+
+        if collected.is_empty() {
             Ok(None)
         } else {
-            Ok(self.pending_events.drain(..).next())
+            let first = collected.remove(0);
+            self.pending_events.extend(collected);
+            Ok(Some(first))
         }
     }
 
