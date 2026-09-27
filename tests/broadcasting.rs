@@ -37,6 +37,7 @@ fn cat_profile(tag: Option<String>) -> Profile {
         cwd: None,
         tag,
         env: HashMap::new(),
+        login_shell: false,
     }
 }
 

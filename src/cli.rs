@@ -50,9 +50,18 @@ pub enum ConfigFormat {
 pub struct Cli {
     /// Program (and args) to run inside the first tab instead of $SHELL.
     ///
-    /// Mirrors the classic `mrxvt -e` flag. Everything after `--` is passed
-    /// to the child program verbatim.
-    #[arg(short = 'e', long = "exec", num_args = 1.., value_name = "COMMAND [ARGS]...")]
+    /// Mirrors the classic `mrxvt -e` / `xterm -e` flag: it takes the rest
+    /// of the command line verbatim, so put it last —
+    /// `rs-mrxvt -e vim -c 'startinsert' file` works, but anything after
+    /// `-e` belongs to the child program.
+    #[arg(
+        short = 'e',
+        long = "exec",
+        num_args = 1..,
+        trailing_var_arg = true,
+        allow_hyphen_values = true,
+        value_name = "COMMAND [ARGS]..."
+    )]
     pub exec: Option<Vec<String>>,
 
     /// Window title (also used as the initial tab title).
@@ -111,4 +120,53 @@ pub struct Cli {
     /// specific adapter is visible to wgpu.
     #[arg(long = "gpu-info")]
     pub gpu_info: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn exec_takes_trailing_args_verbatim() {
+        // xterm-style -e: everything after it is the child command, even
+        // tokens that look like flags. Regression: clap used to stop at
+        // "-c", silently running a bare interactive shell.
+        let cli = Cli::try_parse_from([
+            "rs-mrxvt", "-e", "sh", "-c", "echo SMOKE-TEST-OK; sleep 0.5",
+        ])
+        .unwrap();
+        assert_eq!(
+            cli.exec.unwrap(),
+            vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                "echo SMOKE-TEST-OK; sleep 0.5".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn exec_long_form_also_greedy() {
+        let cli = Cli::try_parse_from([
+            "rs-mrxvt", "--exec", "vim", "-c", "set nu?", "/etc/motd",
+        ])
+        .unwrap();
+        assert_eq!(cli.exec.unwrap().len(), 4);
+    }
+
+    #[test]
+    fn exec_optional() {
+        let cli = Cli::try_parse_from(["rs-mrxvt"]).unwrap();
+        assert!(cli.exec.is_none());
+    }
+
+    #[test]
+    fn options_before_exec_still_parse() {
+        let cli = Cli::try_parse_from(["rs-mrxvt", "-n", "3", "-j", "-e", "htop"])
+            .unwrap();
+        assert_eq!(cli.tabs, 3);
+        assert!(cli.broadcast);
+        assert_eq!(cli.exec.unwrap(), vec!["htop".to_string()]);
+    }
 }

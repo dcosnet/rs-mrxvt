@@ -139,9 +139,8 @@ impl Drop for ConfigWatcher {
 /// Load the config at the given path, picking the parser by extension.
 fn load_config_at(path: &Path) -> Result<Config> {
     #[cfg(feature = "lua")]
-    {
-        return crate::config_lua::load_config_smart(Some(path));
-    }
+    return crate::config_lua::load_config_smart(Some(path));
+
     #[cfg(not(feature = "lua"))]
     {
         let raw = if path.exists() {

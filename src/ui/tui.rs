@@ -43,7 +43,10 @@ use std::io::{self, stdout, Write};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, Event};
+use crossterm::event::{
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -59,10 +62,11 @@ use ratatui::Terminal as RataTerminal;
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::{Column, Line as ALine, Point};
 use alacritty_terminal::term::cell::{Cell, Flags as CellFlags};
+use alacritty_terminal::term::TermMode;
 use alacritty_terminal::vte::ansi::{Color as AnsiColor, NamedColor};
 
 use crate::app::App;
-use crate::mouse::{MouseButton, MouseEventKind, MouseMods};
+use crate::mouse::{MouseButton, MouseEventKind, MouseMods, Selection};
 use crate::terminal::manager::BroadcastTarget;
 use crate::ui::backend::BackendFactory;
 use crate::ui::event::{AppEvent, AppMouseEvent};
@@ -117,7 +121,7 @@ impl TuiRenderer {
 
             // ---- Terminal area ----
             if let Some(tab) = manager.tabs.get(active_idx) {
-                render_terminal_grid(f, tab, chunks[1]);
+                render_terminal_grid(f, tab, chunks[1], &app.session.selection);
             } else {
                 let empty = Paragraph::new("No tabs. Press Ctrl+Shift+T to create one.")
                     .alignment(Alignment::Center);
@@ -125,21 +129,47 @@ impl TuiRenderer {
             }
 
             // ---- Status bar ----
-            let (status_text, status_style) = match &manager.broadcast {
-                BroadcastTarget::Active => (
-                    format!(" rs-mrxvt  •  tabs={}  active={}  ", manager.tabs.len(), active_idx + 1),
-                    Style::default().fg(Color::Black).bg(Color::DarkGray),
+            let mut status_left = match &manager.broadcast {
+                BroadcastTarget::Active => format!(
+                    " rs-mrxvt  •  tabs={}  active={}  ",
+                    manager.tabs.len(),
+                    active_idx + 1
                 ),
-                BroadcastTarget::All => (
-                    format!(" ● BROADCAST:All  •  tabs={}  ", manager.tabs.len()),
-                    Style::default().fg(Color::White).bg(Color::Red).add_modifier(Modifier::BOLD),
-                ),
-                BroadcastTarget::Group(g) => (
-                    format!(" ● BROADCAST:{}  •  tabs={}  ", g, manager.tabs.len()),
-                    Style::default().fg(Color::White).bg(Color::Magenta).add_modifier(Modifier::BOLD),
-                ),
+                BroadcastTarget::All => {
+                    format!(" ● BROADCAST:All  •  tabs={}  ", manager.tabs.len())
+                }
+                BroadcastTarget::Group(g) => {
+                    format!(" ● BROADCAST:{}  •  tabs={}  ", g, manager.tabs.len())
+                }
             };
-            f.render_widget(Paragraph::new(status_text).style(status_style), chunks[2]);
+            let mut status_style = match &manager.broadcast {
+                BroadcastTarget::Active => {
+                    Style::default().fg(Color::Black).bg(Color::DarkGray)
+                }
+                BroadcastTarget::All => Style::default()
+                    .fg(Color::White)
+                    .bg(Color::Red)
+                    .add_modifier(Modifier::BOLD),
+                BroadcastTarget::Group(_) => Style::default()
+                    .fg(Color::White)
+                    .bg(Color::Magenta)
+                    .add_modifier(Modifier::BOLD),
+            };
+
+            // Scrollback indicator when the viewport is raised.
+            if let Some(tab) = manager.tabs.get(active_idx) {
+                let off = tab.display_offset();
+                if off > 0 {
+                    status_left.push_str(&format!("↑{off}  "));
+                }
+            }
+
+            // Transient notice (copy/paste feedback, bell, …).
+            if let Some(notice) = app.active_notice() {
+                status_style = Style::default().fg(Color::Black).bg(Color::Yellow);
+                status_left = format!(" {notice}  •  {status_left}");
+            }
+            f.render_widget(Paragraph::new(status_left).style(status_style), chunks[2]);
 
             // ---- Command palette overlay ----
             if palette_open {
@@ -171,12 +201,16 @@ impl Renderer for TuiRenderer {
         flush_stdin("after enable_raw_mode");
 
         // Step 3: Send our init escape sequences (alternate screen, mouse
-        // capture, cursor hide) and flush them to the outer terminal.
+        // capture, bracketed paste, cursor hide) and flush them to the
+        // outer terminal. Bracketed paste means the host terminal delivers
+        // its own paste (Ctrl+Shift+V / menu) as a Paste event instead of
+        // synthesizing keystrokes.
         let mut out = stdout();
         execute!(
             out,
             EnterAlternateScreen,
             EnableMouseCapture,
+            EnableBracketedPaste,
             Hide
         )
         .context("entering alt screen")?;
@@ -208,7 +242,13 @@ impl Renderer for TuiRenderer {
 
     fn fini(&mut self) -> Result<()> {
         let mut out = stdout();
-        if let Err(e) = execute!(out, LeaveAlternateScreen, DisableMouseCapture, Show) {
+        if let Err(e) = execute!(
+            out,
+            LeaveAlternateScreen,
+            DisableMouseCapture,
+            DisableBracketedPaste,
+            Show
+        ) {
             log::error!("failed to restore terminal: {e}");
         }
         if let Err(e) = disable_raw_mode() {
@@ -265,6 +305,7 @@ fn render_terminal_grid(
     f: &mut ratatui::Frame<'_>,
     tab: &crate::terminal::TerminalTab,
     area: Rect,
+    selection: &Selection,
 ) {
     let grid = tab.term.grid();
 
@@ -281,22 +322,59 @@ fn render_terminal_grid(
     let start_line = -i32::try_from(display_offset).unwrap_or(i32::MAX);
     let render_rows = rows.min(screen_lines);
 
+    // Block cursor position (viewport row), if visible.
+    let show_cursor = tab.term.mode().contains(TermMode::SHOW_CURSOR);
+    let cursor_pos: Option<(usize, usize)> = show_cursor
+        .then(|| {
+            let c = &grid.cursor.point;
+            let row = c.line.0 + start_line; // grid Line → screen row
+            let col = c.column.0;
+            (row >= 0 && (row as usize) < render_rows && col < cols).then_some((row as usize, col))
+        })
+        .flatten();
+
     let mut lines: Vec<Line> = Vec::with_capacity(render_rows);
     for row_idx in 0..render_rows as i32 {
         let line = ALine(start_line + row_idx);
+        let row = row_idx as usize;
+
+        // Selected column span for this row, if any.
+        let sel_span = if selection.is_active() {
+            selection.line_span(line.0, cols)
+        } else {
+            None
+        };
+
         let mut spans: Vec<Span> = Vec::with_capacity(cols);
 
         for col_idx in 0..cols {
             let point = Point { line, column: Column(col_idx) };
             let cell: &Cell = &grid[point];
 
+            let mut style = cell_to_style(cell);
+
+            // Selection highlight: reverse video with a distinct tint.
+            if let Some((sel_start, sel_end)) = sel_span {
+                if col_idx >= sel_start && col_idx < sel_end {
+                    style = style
+                        .add_modifier(Modifier::REVERSED)
+                        .bg(Color::Rgb(60, 71, 100))
+                        .fg(color_to_ratatui(cell.fg));
+                }
+            }
+
+            // Block cursor.
+            if let Some((crow, ccol)) = cursor_pos {
+                if crow == row && ccol == col_idx {
+                    style = style.add_modifier(Modifier::REVERSED);
+                }
+            }
+
             if cell.c == ' ' || cell.c == '\0' {
-                let style = cell_to_style(cell);
                 spans.push(Span::styled(" ", style));
                 continue;
             }
 
-            let style = cell_to_style(cell);
             spans.push(Span::styled(cell.c.to_string(), style));
         }
 
@@ -435,21 +513,27 @@ fn merge_spans(spans: Vec<Span>) -> Vec<Span> {
 /// Crossterm reports mouse positions in both pixel and cell coordinates;
 /// we use the cell coordinates (column, row) which crossterm computes
 /// from the terminal's reported cell size.
+///
+/// Button releases keep their button identity (crossterm's `Up(b)` carries
+/// the button) so local selection logic can distinguish left-release from
+/// other releases; the mouse encoders ignore it (release is signaled by
+/// the event kind).
 fn crossterm_mouse_to_app(m: crossterm::event::MouseEvent) -> AppMouseEvent {
     use crossterm::event::{MouseButton as CButton, MouseEventKind as CKind};
 
-    let button = match m.kind {
-        CKind::Down(b) | CKind::Drag(b) => match b {
-            CButton::Left => MouseButton::Left,
-            CButton::Right => MouseButton::Right,
-            CButton::Middle => MouseButton::Middle,
-        },
-        CKind::Up(_) => MouseButton::None,
+    let map_button = |b: &CButton| match b {
+        CButton::Left => MouseButton::Left,
+        CButton::Right => MouseButton::Right,
+        CButton::Middle => MouseButton::Middle,
+    };
+
+    let button = match &m.kind {
+        CKind::Down(b) | CKind::Drag(b) => map_button(b),
+        CKind::Up(b) => map_button(b),
         CKind::ScrollDown => MouseButton::WheelDown,
         CKind::ScrollUp => MouseButton::WheelUp,
-        // Horizontal scroll: treat as no button (rarely used by terminal apps).
-        CKind::ScrollLeft | CKind::Moved => MouseButton::None,
-        CKind::ScrollRight => MouseButton::None,
+        // Horizontal scroll / plain motion: no button.
+        CKind::ScrollLeft | CKind::ScrollRight | CKind::Moved => MouseButton::None,
     };
     let kind = match m.kind {
         CKind::Down(_) => MouseEventKind::Press,

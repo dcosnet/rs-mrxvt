@@ -258,6 +258,19 @@ impl KeyBindingTable {
         t.bind("Alt+Left", Command::PrevTab);
         t.bind("Alt+Right", Command::NextTab);
 
+        // Clipboard: the modern xterm/ghostty-class chords, plus the
+        // classic Insert-key aliases.
+        t.bind("Ctrl+Shift+C", Command::CopySelection);
+        t.bind("Ctrl+Shift+V", Command::PasteClipboard);
+        t.bind("Ctrl+Insert", Command::CopySelection);
+        t.bind("Shift+Insert", Command::PasteClipboard);
+
+        // Scrollback navigation (xterm-style Shift-modified navigation keys).
+        t.bind("Shift+PageUp", Command::ScrollPageUp);
+        t.bind("Shift+PageDown", Command::ScrollPageDown);
+        t.bind("Shift+Home", Command::ScrollToTop);
+        t.bind("Shift+End", Command::ScrollToBottom);
+
         t
     }
 
@@ -403,5 +416,45 @@ mod tests {
         let t = KeyBindingTable::defaults();
         let ev = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::ALT);
         assert_eq!(t.resolve(ev), None);
+    }
+
+    #[test]
+    fn copy_paste_chords_bound() {
+        let t = KeyBindingTable::defaults();
+        // crossterm reports Ctrl+Shift+C with an uppercase char.
+        let ev = KeyEvent::new(KeyCode::Char('C'), KeyModifiers::CONTROL | KeyModifiers::SHIFT);
+        assert_eq!(t.resolve(ev), Some(Command::CopySelection));
+        let ev = KeyEvent::new(KeyCode::Char('V'), KeyModifiers::CONTROL | KeyModifiers::SHIFT);
+        assert_eq!(t.resolve(ev), Some(Command::PasteClipboard));
+    }
+
+    #[test]
+    fn insert_key_clipboard_aliases_bound() {
+        let t = KeyBindingTable::defaults();
+        let ev = KeyEvent::new(KeyCode::Insert, KeyModifiers::CONTROL);
+        assert_eq!(t.resolve(ev), Some(Command::CopySelection));
+        let ev = KeyEvent::new(KeyCode::Insert, KeyModifiers::SHIFT);
+        assert_eq!(t.resolve(ev), Some(Command::PasteClipboard));
+    }
+
+    #[test]
+    fn shift_page_keys_scroll_scrollback() {
+        let t = KeyBindingTable::defaults();
+        let ev = KeyEvent::new(KeyCode::PageUp, KeyModifiers::SHIFT);
+        assert_eq!(t.resolve(ev), Some(Command::ScrollPageUp));
+        let ev = KeyEvent::new(KeyCode::PageDown, KeyModifiers::SHIFT);
+        assert_eq!(t.resolve(ev), Some(Command::ScrollPageDown));
+        // Unshifted PageUp passes through to the child.
+        let ev = KeyEvent::new(KeyCode::PageUp, KeyModifiers::empty());
+        assert_eq!(t.resolve(ev), None);
+    }
+
+    #[test]
+    fn shift_home_end_jump_scrollback() {
+        let t = KeyBindingTable::defaults();
+        let ev = KeyEvent::new(KeyCode::Home, KeyModifiers::SHIFT);
+        assert_eq!(t.resolve(ev), Some(Command::ScrollToTop));
+        let ev = KeyEvent::new(KeyCode::End, KeyModifiers::SHIFT);
+        assert_eq!(t.resolve(ev), Some(Command::ScrollToBottom));
     }
 }

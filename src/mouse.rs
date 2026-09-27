@@ -136,6 +136,10 @@ pub enum MouseEventKind {
 /// flag — actually for SGR we just encode button+mods, motion is a separate
 /// M vs m signal).
 pub fn encode_sgr(ev: MouseEvent, mode: MouseMode) -> Option<Vec<u8>> {
+    if !mode.sgr {
+        // SGR encoding was not negotiated; fall back to legacy elsewhere.
+        return None;
+    }
     let code = button_code(ev.button, ev.mods);
     let suffix = match ev.kind {
         MouseEventKind::Press => {
@@ -184,11 +188,24 @@ pub fn encode_x11(ev: MouseEvent, mode: MouseMode) -> Option<Vec<u8>> {
     if !_should {
         return None;
     }
-    let mut code = button_code(ev.button, ev.mods);
-    if ev.kind == MouseEventKind::Motion {
-        code |= 32; // motion flag
+    // Legacy protocol encodes release as button 3 ("no button") and motion
+    // with bit 5 set, regardless of the actual button.
+    let mod_bits = {
+        let mut bits = 0u32;
+        if ev.mods.shift { bits |= 4; }
+        if ev.mods.alt { bits |= 8; }
+        if ev.mods.ctrl { bits |= 16; }
+        bits
+    };
+    let mut code = match ev.kind {
+        MouseEventKind::Release => 3 | mod_bits,
+        MouseEventKind::Motion => 32 | button_code(ev.button, MouseMods::default()) | mod_bits,
+        MouseEventKind::Press => button_code(ev.button, MouseMods::default()) | mod_bits,
+    };
+    if code > 255 - 32 {
+        code = 255 - 32;
     }
-    let b = (code.min(255 - 32) + 32) as u8;
+    let b = (code + 32) as u8;
     // Coords: 1-indexed, clamped to 1..223 (bytes 33..255 after +32).
     // Clamp to 223 so that 223 + 32 = 255 = u8::MAX (no overflow).
     let col_clamped = (ev.col.saturating_add(1)).clamp(1, 223);
@@ -215,13 +232,41 @@ fn button_code(button: MouseButton, mods: MouseMods) -> u32 {
 
 // ─── Selection state machine ─────────────────────────────────────────────────
 
-/// A text selection. Used by renderers for click-drag-to-select.
+/// A point in the terminal grid (not the viewport). `line` uses the
+/// alacritty grid convention: `Line(0)` is the top visible row when the
+/// display offset is 0, and negative values reach into scrollback history.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SelPoint {
+    pub line: i32,
+    pub col: usize,
+}
+
+/// How the selection was made — decides how it renders and copies.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SelectionKind {
+    /// Click-drag: character granularity, line-based span.
+    #[default]
+    Simple,
+    /// Double-click: expanded to word boundaries.
+    Word,
+    /// Triple-click: whole lines.
+    Line,
+}
+
+/// A text selection in grid coordinates.
+///
+/// `anchor` is where the gesture began; `head` is the current extent. The
+/// pair is normalized on demand so the selection is direction-independent.
+/// The span is **line-based** (like every mainstream terminal): the first
+/// and last lines are partially selected between the two points, and every
+/// line between them is fully selected.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Selection {
-    /// Start point (cell coords). `None` = no active selection.
-    pub start: Option<(u32, u32)>,
-    /// End point (cell coords). `None` = single-click.
-    pub end: Option<(u32, u32)>,
+    pub kind: SelectionKind,
+    /// Where the gesture began. `None` = no active selection.
+    pub anchor: Option<SelPoint>,
+    /// Current extent (`None` while the gesture hasn't moved).
+    pub head: Option<SelPoint>,
 }
 
 impl Selection {
@@ -229,47 +274,91 @@ impl Selection {
         Self::default()
     }
 
-    /// Begin a selection at the given cell.
-    pub fn begin(&mut self, col: u32, row: u32) {
-        self.start = Some((col, row));
-        self.end = Some((col, row));
+    /// Begin a selection of the given kind at a grid point.
+    pub fn begin(&mut self, kind: SelectionKind, p: SelPoint) {
+        self.kind = kind;
+        self.anchor = Some(p);
+        self.head = Some(p);
     }
 
-    /// Extend the selection to the given cell.
-    pub fn extend(&mut self, col: u32, row: u32) {
-        if self.start.is_some() {
-            self.end = Some((col, row));
+    /// Extend the selection to a grid point (mouse drag / motion).
+    pub fn extend(&mut self, p: SelPoint) {
+        if self.anchor.is_some() {
+            self.head = Some(p);
         }
+    }
+
+    /// Replace both endpoints (used for word/line re-selection on drag).
+    pub fn set_span(&mut self, kind: SelectionKind, a: SelPoint, b: SelPoint) {
+        self.kind = kind;
+        self.anchor = Some(a);
+        self.head = Some(b);
     }
 
     /// Clear the selection.
     pub fn clear(&mut self) {
-        self.start = None;
-        self.end = None;
+        self.anchor = None;
+        self.head = None;
     }
 
     /// Is there an active selection?
     pub fn is_active(&self) -> bool {
-        self.start.is_some() && self.end.is_some()
+        self.anchor.is_some() && self.head.is_some()
     }
 
-    /// Iterate over the selected cells in row-major order.
-    pub fn cells(&self) -> Vec<(u32, u32)> {
-        let Some((sx, sy)) = self.start else { return Vec::new(); };
-        let Some((ex, ey)) = self.end else { return Vec::new(); };
-        // Normalize: top-left to bottom-right.
-        let (x1, y1) = (sx.min(ex), sy.min(ey));
-        let (x2, y2) = (sx.max(ex), sy.max(ey));
-        (y1..=y2).flat_map(|y| (x1..=x2).map(move |x| (x, y))).collect()
+    /// Anchor/head ordered top-left → bottom-right.
+    pub fn normalized(&self) -> Option<(SelPoint, SelPoint)> {
+        let a = self.anchor?;
+        let b = self.head?;
+        if (b.line, b.col) < (a.line, a.col) {
+            Some((b, a))
+        } else {
+            Some((a, b))
+        }
     }
 
     /// True if the selection spans more than one cell.
     pub fn is_multi_cell(&self) -> bool {
-        if let (Some(s), Some(e)) = (self.start, self.end) {
-            s != e
-        } else {
-            false
+        self.normalized().map(|(a, b)| a != b).unwrap_or(false)
+    }
+
+    /// For a given grid line, the selected column range `[start, end)`
+    /// (half-open), or `None` if the line isn't selected. `cols` is the
+    /// grid width, used for fully-selected interior lines.
+    pub fn line_span(&self, line: i32, cols: usize) -> Option<(usize, usize)> {
+        let (a, b) = self.normalized()?;
+        if line < a.line || line > b.line {
+            return None;
         }
+        let (start, end) = match self.kind {
+            SelectionKind::Line => (0, cols),
+            SelectionKind::Simple | SelectionKind::Word => {
+                if a.line == b.line {
+                    (a.col, b.col + 1)
+                } else if line == a.line {
+                    (a.col, cols)
+                } else if line == b.line {
+                    (0, b.col + 1)
+                } else {
+                    (0, cols)
+                }
+            }
+        };
+        Some((start, end.min(cols)))
+    }
+
+    /// Iterate over the selected grid lines (inclusive range).
+    pub fn lines(&self) -> Vec<i32> {
+        match self.normalized() {
+            Some((a, b)) => (a.line..=b.line).collect(),
+            None => Vec::new(),
+        }
+    }
+
+    /// Does this line fall inside the selection at all? (Cheap check for
+    /// renderers deciding whether to inspect a row.)
+    pub fn includes_line(&self, line: i32) -> bool {
+        self.normalized().map(|(a, b)| line >= a.line && line <= b.line).unwrap_or(false)
     }
 }
 
@@ -390,6 +479,21 @@ mod tests {
     }
 
     #[test]
+    fn sgr_skipped_when_sgr_not_negotiated() {
+        // X11 reporting on but SGR off → SGR encoder must not fire; the
+        // caller falls back to the legacy encoder.
+        let ev = MouseEvent {
+            button: MouseButton::Left,
+            col: 0, row: 0,
+            mods: MouseMods::default(),
+            kind: MouseEventKind::Press,
+        };
+        let mode = MouseMode { x11: true, ..Default::default() };
+        assert!(encode_sgr(ev, mode).is_none());
+        assert!(encode_x11(ev, mode).is_some());
+    }
+
+    #[test]
     fn x11_legacy_encoding() {
         let ev = MouseEvent {
             button: MouseButton::Left,
@@ -423,48 +527,94 @@ mod tests {
     fn selection_begin_and_extend() {
         let mut s = Selection::new();
         assert!(!s.is_active());
-        s.begin(0, 0);
+        s.begin(SelectionKind::Simple, SelPoint { line: 0, col: 0 });
         assert!(s.is_active());
-        s.extend(5, 2);
+        s.extend(SelPoint { line: 2, col: 5 });
         assert!(s.is_multi_cell());
     }
 
     #[test]
-    fn selection_cells_row_major() {
+    fn selection_line_span_single_row() {
         let mut s = Selection::new();
-        s.begin(0, 0);
-        s.extend(2, 1);
-        let cells = s.cells();
-        // 3 cols × 2 rows = 6 cells.
-        assert_eq!(cells.len(), 6);
-        assert!(cells.contains(&(0, 0)));
-        assert!(cells.contains(&(2, 1)));
+        s.begin(SelectionKind::Simple, SelPoint { line: 3, col: 2 });
+        s.extend(SelPoint { line: 3, col: 5 });
+        assert_eq!(s.line_span(3, 80), Some((2, 6)));
+        assert_eq!(s.line_span(2, 80), None);
+        assert_eq!(s.line_span(4, 80), None);
     }
 
     #[test]
-    fn selection_normalizes_swapped_points() {
+    fn selection_line_span_multi_row_partial_ends() {
         let mut s = Selection::new();
-        s.begin(5, 5);
-        s.extend(1, 1);
-        let cells = s.cells();
-        // Should still cover the same rectangle regardless of direction.
-        assert_eq!(cells.len(), 5 * 5);
-        assert!(cells.contains(&(1, 1)));
-        assert!(cells.contains(&(5, 5)));
+        s.begin(SelectionKind::Simple, SelPoint { line: 1, col: 10 });
+        s.extend(SelPoint { line: 3, col: 4 });
+        // First row: from col 10 to end of line.
+        assert_eq!(s.line_span(1, 80), Some((10, 80)));
+        // Interior row: full width.
+        assert_eq!(s.line_span(2, 80), Some((0, 80)));
+        // Last row: start to col 4 inclusive.
+        assert_eq!(s.line_span(3, 80), Some((0, 5)));
+        assert_eq!(s.line_span(0, 80), None);
+        assert_eq!(s.line_span(4, 80), None);
+    }
+
+    #[test]
+    fn selection_direction_independent() {
+        let mut s = Selection::new();
+        // Drag bottom-right → top-left; spans must match the forward drag.
+        s.begin(SelectionKind::Simple, SelPoint { line: 3, col: 4 });
+        s.extend(SelPoint { line: 1, col: 10 });
+        assert_eq!(s.line_span(1, 80), Some((10, 80)));
+        assert_eq!(s.line_span(2, 80), Some((0, 80)));
+        assert_eq!(s.line_span(3, 80), Some((0, 5)));
+        let (a, b) = s.normalized().unwrap();
+        assert_eq!((a.line, a.col), (1, 10));
+        assert_eq!((b.line, b.col), (3, 4));
+    }
+
+    #[test]
+    fn line_selection_spans_full_rows() {
+        let mut s = Selection::new();
+        s.begin(SelectionKind::Line, SelPoint { line: 2, col: 30 });
+        s.extend(SelPoint { line: 4, col: 1 });
+        assert_eq!(s.line_span(2, 80), Some((0, 80)));
+        assert_eq!(s.line_span(3, 80), Some((0, 80)));
+        assert_eq!(s.line_span(4, 80), Some((0, 80)));
+    }
+
+    #[test]
+    fn word_selection_uses_point_bounds() {
+        // Word selections store pre-expanded boundaries, so the span logic
+        // is identical to Simple between those bounds.
+        let mut s = Selection::new();
+        s.set_span(SelectionKind::Word, SelPoint { line: 0, col: 4 }, SelPoint { line: 0, col: 9 });
+        assert_eq!(s.line_span(0, 80), Some((4, 10)));
+    }
+
+    #[test]
+    fn selection_lines_iterates_inclusive() {
+        let mut s = Selection::new();
+        s.begin(SelectionKind::Simple, SelPoint { line: -5, col: 0 });
+        s.extend(SelPoint { line: -3, col: 0 });
+        assert_eq!(s.lines(), vec![-5, -4, -3]);
+        assert!(s.includes_line(-4));
+        assert!(!s.includes_line(-2));
     }
 
     #[test]
     fn selection_clear() {
         let mut s = Selection::new();
-        s.begin(0, 0);
+        s.begin(SelectionKind::Simple, SelPoint { line: 0, col: 0 });
         s.clear();
         assert!(!s.is_active());
+        assert!(!s.is_multi_cell());
+        assert_eq!(s.line_span(0, 80), None);
     }
 
     #[test]
     fn selection_single_cell_not_multi() {
         let mut s = Selection::new();
-        s.begin(3, 3);
+        s.begin(SelectionKind::Simple, SelPoint { line: 3, col: 3 });
         assert!(!s.is_multi_cell());
     }
 }

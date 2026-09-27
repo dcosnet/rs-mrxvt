@@ -35,18 +35,58 @@
 //! The renderers read this state each frame to draw selection highlights,
 //! underline hyperlinks, and composite inline images.
 
+use std::time::{Duration, Instant};
+
 use crate::hyperlinks::HyperlinkStore;
-use crate::mouse::{MouseMode, Selection};
+use crate::mouse::{MouseMode, Selection, SelectionKind};
 
 #[cfg(feature = "images")]
 use crate::images::ImageStore;
 
+/// Multi-click window: clicks within this gap count as double/triple clicks.
+pub const MULTI_CLICK_WINDOW: Duration = Duration::from_millis(400);
+
+/// Tracks click cadence to distinguish single / double / triple clicks.
+#[derive(Debug, Default)]
+pub struct ClickTracker {
+    last_at: Option<Instant>,
+    count: u8,
+}
+
+impl ClickTracker {
+    /// Register a click; returns the selection kind it implies.
+    pub fn register(&mut self, now: Instant) -> SelectionKind {
+        let within = self
+            .last_at
+            .map(|t| now.duration_since(t) < MULTI_CLICK_WINDOW)
+            .unwrap_or(false);
+        self.count = if within { self.count.saturating_add(1) } else { 1 };
+        self.last_at = Some(now);
+        match self.count % 3 {
+            1 => SelectionKind::Simple,
+            2 => SelectionKind::Word,
+            _ => SelectionKind::Line,
+        }
+    }
+
+    /// The current click count in the active cadence window.
+    pub fn count(&self) -> u8 {
+        self.count
+    }
+}
+
 /// Bundle of session state shared between App, PTY reader, and renderers.
 pub struct SessionState {
     /// Current mouse reporting mode (set by the child via DECSET).
+    ///
+    /// Note: the authoritative source is the active tab's `TermMode`
+    /// (see `TerminalTab::mouse_mode`); this copy exists for renderers
+    /// and headless use.
     pub mouse_mode: MouseMode,
     /// Active text selection (when mouse reporting is off).
     pub selection: Selection,
+    /// Click-cadence tracker for double/triple-click selection.
+    pub clicks: ClickTracker,
     /// OSC 8 hyperlinks seen in the PTY stream.
     pub hyperlinks: HyperlinkStore,
     /// Inline images (iTerm2 + Sixel). Only available with `--features images`.
@@ -65,6 +105,7 @@ impl SessionState {
         Self {
             mouse_mode: MouseMode::default(),
             selection: Selection::new(),
+            clicks: ClickTracker::default(),
             hyperlinks: HyperlinkStore::new(),
             #[cfg(feature = "images")]
             images: ImageStore::new(),
@@ -99,7 +140,7 @@ mod tests {
     #[test]
     fn reset_clears_everything() {
         let mut s = SessionState::new();
-        s.selection.begin(0, 0);
+        s.selection.begin(crate::mouse::SelectionKind::Simple, crate::mouse::SelPoint { line: 0, col: 0 });
         s.hyperlinks.add(crate::hyperlinks::Hyperlink {
             uri: "x".into(),
             id: None,
@@ -119,5 +160,28 @@ mod tests {
         assert!(s.mouse_mode.any_reporting());
         s.mouse_mode.x11 = false;
         assert!(!s.mouse_mode.any_reporting());
+    }
+
+    #[test]
+    fn click_tracker_cycles_kinds() {
+        let mut t = ClickTracker::default();
+        let now = Instant::now();
+        assert_eq!(t.register(now), crate::mouse::SelectionKind::Simple);
+        assert_eq!(t.register(now + Duration::from_millis(100)), crate::mouse::SelectionKind::Word);
+        assert_eq!(t.register(now + Duration::from_millis(200)), crate::mouse::SelectionKind::Line);
+        // Fourth click restarts the cycle.
+        assert_eq!(t.register(now + Duration::from_millis(300)), crate::mouse::SelectionKind::Simple);
+    }
+
+    #[test]
+    fn click_tracker_resets_after_window() {
+        let mut t = ClickTracker::default();
+        let now = Instant::now();
+        assert_eq!(t.register(now), crate::mouse::SelectionKind::Simple);
+        // Beyond the 400ms window → single click again.
+        assert_eq!(
+            t.register(now + Duration::from_millis(500)),
+            crate::mouse::SelectionKind::Simple
+        );
     }
 }

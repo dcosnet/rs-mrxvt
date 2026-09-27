@@ -13,6 +13,18 @@ scrollback = 10000          # lines of scrollback history per tab
 shell = "/bin/bash"          # default shell (bash); override per-profile
 
 # ──────────────────────────────────────────────────────────────────────────
+# Clipboard (copy / paste)
+# ──────────────────────────────────────────────────────────────────────────
+[clipboard]
+copy_on_select = true        # classic xterm/mrxvt: selecting text copies it
+osc52 = true                 # also mirror copies to the host terminal (OSC 52);
+                             # this is what makes copy work over SSH
+osc52_read = false           # allow programs (tmux/nvim) to READ the clipboard
+                             # via OSC 52 queries — off by default for safety
+# tool = "xclip"             # force a clipboard tool; auto-detects otherwise
+                             # (xclip / xsel / wl-clipboard / pbcopy / termux)
+
+# ──────────────────────────────────────────────────────────────────────────
 # UI behavior
 # ──────────────────────────────────────────────────────────────────────────
 [ui]
@@ -28,7 +40,12 @@ focus = "click"             # "click" (default) | "follow" (focus follows mouse)
 default_profile = "default"
 
 [profiles.default]
-command = ["bash"]           # bash is the primary shell
+# Empty command = run the user's default shell ($SHELL, then /etc/passwd)
+# as a LOGIN shell — it sources /etc/profile, so distro GUI session
+# variables (D-Bus, flatpak/snap paths) reach apps launched from the tab.
+# Set login_shell = false if you don't want that.
+# command = ["bash"]
+login_shell = true
 # cwd = "/home/user/projects"
 # tag = "local"
 

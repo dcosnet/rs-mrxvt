@@ -37,6 +37,7 @@ fn sh_profile(cmd: &str) -> Profile {
         cwd: None,
         tag: None,
         env: HashMap::new(),
+        login_shell: false,
     }
 }
 

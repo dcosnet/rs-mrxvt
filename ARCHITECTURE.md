@@ -13,14 +13,18 @@ src/
 ├── command.rs        — the Command enum (single source of truth for actions)
 ├── config.rs         — TOML config + ConfigSource trait (future: Lua)
 ├── app.rs            — App struct: owns TerminalManager + InputRouter + PaletteState
+│                       + SessionState + the clipboard backend
+├── clipboard.rs      — copy/paste: external tools + OSC 52 + MockClipboard
 ├── input/
 │   ├── mod.rs
 │   ├── bindings.rs   — KeyChord + KeyBindingTable (default mrxvt chords)
 │   └── router.rs     — translate crossterm KeyEvents to bytes OR Commands
+├── session.rs        — SessionState: mouse/selection/clicks/hyperlinks/images
+├── mouse.rs          — mouse modes, SGR/X11 encoders, line-based Selection
 ├── terminal/
 │   ├── mod.rs
-│   ├── pty.rs        — PtySession: spawn child + read/write/resize
-│   ├── tab.rs        — TerminalTab: PtySession + Term<NoopListener> + reader thread
+│   ├── pty.rs        — PtySession: spawn child (login-shell aware) + read/write/resize
+│   ├── tab.rs        — TerminalTab: PtySession + Term + reader thread + VT-event channel
 │   └── manager.rs    — TerminalManager: tabs vec, active idx, broadcast router
 └── ui/
     ├── mod.rs        — Renderer trait (the swap point for backends)
@@ -243,12 +247,74 @@ pub trait ConfigSource {
 `--config-format lua` flag or by file extension. The rest of the codebase
 won't need to change.
 
-## 11. Testing strategy
+## 11. Clipboard, selection, and VT events
 
-- **Unit tests** (`cargo test --lib`): 76 tests covering input routing,
+### Clipboard
+
+`ClipboardBackend` is the swap point (`src/clipboard.rs`):
+
+```rust
+pub trait ClipboardBackend: Send {
+    fn store(&mut self, kind: ClipboardKind, text: &str) -> Result<()>;
+    fn load(&mut self, kind: ClipboardKind) -> Result<String>;
+}
+```
+
+Production uses `SystemClipboard`: writes go to the first available
+external tool (`xclip`/`xsel`/`wl-copy`/`pbcopy`/`termux-clipboard-set`,
+auto-detected and cached) **and** are mirrored to the host terminal as an
+OSC 52 escape sequence — which is what makes copy work over SSH. Reads
+come from the external tool. Tests use `MockClipboard` (with an `as_any`
+downcast hook so tests can inspect stores).
+
+Paste flows through `sanitize_paste` (strip C0/C1 injection, normalize
+CRLF, drop one trailing newline) and is wrapped in bracketed-paste
+markers when the child enabled DECSET 2004.
+
+### Selection
+
+`Selection` (`src/mouse.rs`) stores grid coordinates (`SelPoint`), so a
+selection survives scrolling. It is **line-based** like every mainstream
+terminal: `line_span(line, cols)` gives the half-open column range for a
+row; interior rows are fully selected. `kind` distinguishes
+Simple/Word/Line gestures (single/double/triple click via
+`SessionState.clicks`), and `TerminalTab::selection_text` extracts the
+text (trailing whitespace trimmed per line, `\n`-joined).
+
+### VT events
+
+`TerminalTab`'s `EventForwarder` (the `Term`'s `EventListener`) pushes
+alacritty events into a channel during `poll_pty`. Each tick,
+`TerminalManager::drain_events` collects them and `App::handle_tab_event`
+acts:
+
+| Event | Behavior |
+|-------|----------|
+| `Title(s)` / `ResetTitle` | rename the tab / restore default title |
+| `ClipboardStore(ty, s)` | OSC 52 write → clipboard backend (size-capped) |
+| `ClipboardLoad(ty, fmt)` | OSC 52 read → gated on `clipboard.osc52_read` |
+| `PtyWrite(s)` | write to that tab's PTY |
+| `Bell` | status-bar notice |
+
+### Login shells and the child environment
+
+The child environment is inherited in full (portable-pty re-applies the
+parent env). Default-shell tabs run as **login shells**
+(`CommandBuilder::new_default_prog`, argv0 `-bash`, `profile.login_shell
+= false` to opt out), because `/etc/profile` is where distros export the
+GUI session environment — without it, some GUI apps launched from tabs
+can't find their display. When neither `DISPLAY` nor `WAYLAND_DISPLAY`
+reaches the child, `PtySession::spawn` logs a one-time warning.
+
+## 12. Testing strategy
+
+- **Unit tests** (`cargo test --lib`): 200+ tests covering input routing,
   config parsing, tab manager state transitions, palette filtering,
   keybinding resolution, key-to-bytes translation, event abstraction,
-  backend selection logic, and app event handling.
+  backend selection logic, app event handling, clipboard (base64/OSC 52,
+  paste sanitation, mock round-trips), selection (line spans, word/line
+  kinds, text extraction over real PTYs), scrollback, mouse-mode
+  bridging, OSC 52/title event forwarding, and login-shell spawning.
 - **Integration tests** (`tests/integration.rs`): 10 end-to-end tests
   spawning real subprocesses via PTY and verifying the alacritty_terminal
   emulator renders the output.
@@ -258,10 +324,11 @@ won't need to change.
   spawns N PTYs (default 50), broadcasts a marker, and verifies all N
   received it within the timeout.
 
-Total: 93 Rust tests + 1 Python harness, all passing. The same suite
-passes with `--features gpu` enabled.
+Total: 220+ Rust tests + 1 Python harness, all passing. The same suite
+passes with `--features gpu`, `--features lua`, `--features images`, and
+combinations thereof.
 
-## 12. Build configurations
+## 13. Build configurations
 
 | Config                | Cargo command                      | Backends available      |
 |-----------------------|------------------------------------|-------------------------|

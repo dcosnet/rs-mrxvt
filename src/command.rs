@@ -51,6 +51,24 @@ pub enum Command {
     ToggleBroadcastGroup(String),
     /// Tag the active tab with a group name.
     TagActiveTab(String),
+    /// Copy the active selection to the system clipboard.
+    CopySelection,
+    /// Paste the system clipboard into the terminal.
+    PasteClipboard,
+    /// Paste the X11 primary (middle-click) selection into the terminal.
+    PastePrimary,
+    /// Scroll the viewport one line up (into scrollback).
+    ScrollLineUp,
+    /// Scroll the viewport one line down (toward the live bottom).
+    ScrollLineDown,
+    /// Scroll the viewport one page up.
+    ScrollPageUp,
+    /// Scroll the viewport one page down.
+    ScrollPageDown,
+    /// Jump the viewport to the top of the scrollback.
+    ScrollToTop,
+    /// Jump the viewport back to the live bottom.
+    ScrollToBottom,
     /// Open the command palette.
     OpenPalette,
     /// Reset the active terminal (clear + send RIS).
@@ -80,6 +98,15 @@ impl Command {
             CommandEntry { command: Command::GotoTab(3),         name: "Go to Tab 4",                category: "Tabs" },
             CommandEntry { command: Command::GotoTab(4),         name: "Go to Tab 5",                category: "Tabs" },
             CommandEntry { command: Command::ToggleBroadcastAll, name: "Toggle Broadcast (All)",     category: "Broadcast" },
+            CommandEntry { command: Command::CopySelection,      name: "Copy Selection",             category: "Clipboard" },
+            CommandEntry { command: Command::PasteClipboard,     name: "Paste from Clipboard",       category: "Clipboard" },
+            CommandEntry { command: Command::PastePrimary,       name: "Paste Primary Selection",    category: "Clipboard" },
+            CommandEntry { command: Command::ScrollLineUp,       name: "Scroll Line Up",             category: "Scrollback" },
+            CommandEntry { command: Command::ScrollLineDown,     name: "Scroll Line Down",           category: "Scrollback" },
+            CommandEntry { command: Command::ScrollPageUp,       name: "Scroll Page Up",             category: "Scrollback" },
+            CommandEntry { command: Command::ScrollPageDown,     name: "Scroll Page Down",           category: "Scrollback" },
+            CommandEntry { command: Command::ScrollToTop,        name: "Scroll to Top",              category: "Scrollback" },
+            CommandEntry { command: Command::ScrollToBottom,     name: "Scroll to Bottom",           category: "Scrollback" },
             CommandEntry { command: Command::ResetTerminal,      name: "Reset Terminal",             category: "Terminal" },
             CommandEntry { command: Command::OpenPalette,        name: "Open Command Palette",       category: "UI" },
             CommandEntry { command: Command::Quit,               name: "Quit",                       category: "App" },
@@ -99,6 +126,15 @@ impl fmt::Display for Command {
             Command::ToggleBroadcastAll => write!(f, "Toggle Broadcast (All)"),
             Command::ToggleBroadcastGroup(g) => write!(f, "Toggle Broadcast ({g})"),
             Command::TagActiveTab(g) => write!(f, "Tag Tab → {g}"),
+            Command::CopySelection => write!(f, "Copy Selection"),
+            Command::PasteClipboard => write!(f, "Paste from Clipboard"),
+            Command::PastePrimary => write!(f, "Paste Primary Selection"),
+            Command::ScrollLineUp => write!(f, "Scroll Line Up"),
+            Command::ScrollLineDown => write!(f, "Scroll Line Down"),
+            Command::ScrollPageUp => write!(f, "Scroll Page Up"),
+            Command::ScrollPageDown => write!(f, "Scroll Page Down"),
+            Command::ScrollToTop => write!(f, "Scroll to Top"),
+            Command::ScrollToBottom => write!(f, "Scroll to Bottom"),
             Command::OpenPalette => write!(f, "Open Command Palette"),
             Command::ResetTerminal => write!(f, "Reset Terminal"),
             Command::Quit => write!(f, "Quit"),

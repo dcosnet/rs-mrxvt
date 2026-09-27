@@ -31,6 +31,7 @@
 //! - [`command`]  — The `Command` enum consumed by the command palette and keybindings.
 
 pub mod cli;
+pub mod clipboard;
 pub mod command;
 pub mod config;
 pub mod config_watch;

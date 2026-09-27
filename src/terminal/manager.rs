@@ -26,6 +26,9 @@
 
 use anyhow::Result;
 
+use alacritty_terminal::event::Event;
+use alacritty_terminal::grid::Scroll;
+
 use crate::command::Command;
 use crate::config::{Config, Profile};
 
@@ -189,31 +192,80 @@ impl TerminalManager {
         }
     }
 
+    /// Set a tab's title (from an OSC 0/2 title event).
+    pub fn set_title(&mut self, idx: usize, title: String) {
+        if let Some(t) = self.tabs.get_mut(idx) {
+            if !title.is_empty() {
+                t.title = title;
+            }
+        }
+    }
+
+    /// Restore a tab's default title (from a ResetTitle event).
+    pub fn reset_title(&mut self, idx: usize) {
+        if let Some(t) = self.tabs.get_mut(idx) {
+            t.title = t.default_title.clone();
+        }
+    }
+
+    /// Drain VT events from every tab, tagged with the tab index.
+    ///
+    /// Call once per event-loop tick after `poll_all`; the caller acts on
+    /// title changes, OSC 52 clipboard requests, bells, and PTY writes.
+    pub fn drain_events(&mut self) -> Vec<(usize, Event)> {
+        let mut out = Vec::new();
+        for (i, tab) in self.tabs.iter_mut().enumerate() {
+            for ev in tab.drain_events() {
+                out.push((i, ev));
+            }
+        }
+        out
+    }
+
     /// Route input bytes to the appropriate tab(s) per the current broadcast mode.
+    ///
+    /// Tabs that receive *keyboard* input are also scrolled back to the live
+    /// bottom (the classic terminal behavior: typing snaps you out of
+    /// scrollback review).
     pub fn route_input(&mut self, data: &[u8]) -> std::io::Result<()> {
         match &self.broadcast {
             BroadcastTarget::Active => {
-                if let Some(tab) = self.tabs.get(self.active) {
+                if let Some(tab) = self.tabs.get_mut(self.active) {
                     tab.write_input(data)?;
+                    tab.scroll_display(Scroll::Bottom);
                 }
                 Ok(())
             }
             BroadcastTarget::All => {
-                self.tabs.iter()
-                    .find_map(|tab| tab.write_input(data).err())
-                    .map_or(Ok(()), Err)
+                for tab in &mut self.tabs {
+                    tab.write_input(data)?;
+                    tab.scroll_display(Scroll::Bottom);
+                }
+                Ok(())
             }
             BroadcastTarget::Group(tag) => {
-                let tagged: Vec<_> = self.tabs.iter()
-                    .filter(|t| t.tag.as_deref() == Some(tag.as_str()))
+                let tagged: Vec<usize> = self
+                    .tabs
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, t)| t.tag.as_deref() == Some(tag.as_str()))
+                    .map(|(i, _)| i)
                     .collect();
-                let first_err = tagged.iter().find_map(|tab| tab.write_input(data).err());
-                // If no tab matched the tag, fall back to active so the user
-                // isn't left typing into the void.
                 if tagged.is_empty() {
-                    if let Some(tab) = self.tabs.get(self.active) {
+                    // If no tab matched the tag, fall back to active so the
+                    // user isn't left typing into the void.
+                    if let Some(tab) = self.tabs.get_mut(self.active) {
                         tab.write_input(data)?;
+                        tab.scroll_display(Scroll::Bottom);
                     }
+                    return Ok(());
+                }
+                let mut first_err = None;
+                for i in tagged {
+                    if let Err(e) = self.tabs[i].write_input(data) {
+                        first_err = first_err.or(Some(e));
+                    }
+                    self.tabs[i].scroll_display(Scroll::Bottom);
                 }
                 first_err.map_or(Ok(()), Err)
             }
@@ -330,6 +382,47 @@ impl TerminalManager {
                 }
                 Action::Continue
             }
+            Command::ScrollLineUp => {
+                if let Some(t) = self.active_tab_mut() {
+                    t.scroll_display(Scroll::Delta(1));
+                }
+                Action::Continue
+            }
+            Command::ScrollLineDown => {
+                if let Some(t) = self.active_tab_mut() {
+                    t.scroll_display(Scroll::Delta(-1));
+                }
+                Action::Continue
+            }
+            Command::ScrollPageUp => {
+                if let Some(t) = self.active_tab_mut() {
+                    t.scroll_display(Scroll::PageUp);
+                }
+                Action::Continue
+            }
+            Command::ScrollPageDown => {
+                if let Some(t) = self.active_tab_mut() {
+                    t.scroll_display(Scroll::PageDown);
+                }
+                Action::Continue
+            }
+            Command::ScrollToTop => {
+                if let Some(t) = self.active_tab_mut() {
+                    t.scroll_display(Scroll::Top);
+                }
+                Action::Continue
+            }
+            Command::ScrollToBottom => {
+                if let Some(t) = self.active_tab_mut() {
+                    t.scroll_display(Scroll::Bottom);
+                }
+                Action::Continue
+            }
+            // Clipboard commands are handled at the App layer (they need
+            // access to the clipboard backend and session selection).
+            Command::CopySelection | Command::PasteClipboard | Command::PastePrimary => {
+                Action::Continue
+            }
             Command::OpenPalette => Action::Continue,
             Command::Quit => Action::Quit,
         }
@@ -355,6 +448,7 @@ mod tests {
             cwd: None,
             tag: None,
             env: HashMap::new(),
+            login_shell: false,
         }
     }
 

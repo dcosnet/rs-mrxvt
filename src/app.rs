@@ -32,20 +32,34 @@
 //! [`AppEvent`], a backend-agnostic enum — every renderer translates its
 //! native events into this type at the boundary.
 
+use std::time::{Duration, Instant};
+
+use alacritty_terminal::event::Event as TermEvent;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::cli::Cli;
+use crate::clipboard::{bracket, sanitize_paste, ClipboardBackend, ClipboardKind, SystemClipboard};
 use crate::command::Command;
 use crate::config::Config;
 use crate::input::router::{InputAction, InputRouter};
 use crate::input::bindings::KeyBindingTable;
-use crate::mouse::{MouseButton, MouseEvent, MouseEventKind};
+use crate::mouse::{MouseButton, MouseEvent, MouseEventKind, SelPoint};
 use crate::session::SessionState;
 use crate::terminal::manager::{Action, BroadcastTarget, TerminalManager};
-use crate::ui::event::{AppEvent, AppKey, AppKeyEvent};
+use crate::ui::event::{AppEvent, AppKey, AppKeyEvent, AppMouseEvent};
 #[cfg(test)]
 use crate::ui::event::AppModifiers;
 use crate::ui::palette::PaletteState;
+
+/// How long a status-bar notice stays visible.
+pub const NOTICE_TTL: Duration = Duration::from_millis(2500);
+
+/// A transient status-bar message (e.g. "Copied 42 chars").
+#[derive(Debug, Clone)]
+pub struct Notice {
+    pub text: String,
+    pub expires: Instant,
+}
 
 /// The app. Construct with [`App::new`], then run with a [`Renderer`].
 pub struct App {
@@ -56,10 +70,25 @@ pub struct App {
     pub config: Config,
     pub cli: Cli,
     pub quit: bool,
+    /// Clipboard backend (system tools + OSC 52 in production, mock in tests).
+    pub clipboard: Box<dyn ClipboardBackend>,
+    /// Transient status-bar message, if any.
+    pub notice: Option<Notice>,
 }
 
 impl App {
     pub fn new(cli: Cli, config: Config) -> anyhow::Result<Self> {
+        let clipboard: Box<dyn ClipboardBackend> =
+            Box::new(SystemClipboard::from_config(&config.clipboard));
+        Self::with_clipboard(cli, config, clipboard)
+    }
+
+    /// Constructor with an explicit clipboard backend (tests use a mock).
+    pub fn with_clipboard(
+        cli: Cli,
+        config: Config,
+        clipboard: Box<dyn ClipboardBackend>,
+    ) -> anyhow::Result<Self> {
         let bindings = KeyBindingTable::defaults();
         let router = InputRouter::new(bindings);
 
@@ -111,8 +140,85 @@ impl App {
             config,
             cli,
             quit: false,
+            clipboard,
+            notice: None,
         })
     }
+
+    /// Show a transient message in the status bar.
+    pub fn notify(&mut self, text: impl Into<String>) {
+        self.notice = Some(Notice {
+            text: text.into(),
+            expires: Instant::now() + NOTICE_TTL,
+        });
+    }
+
+    /// The active notice, if it hasn't expired.
+    pub fn active_notice(&self) -> Option<&str> {
+        self.notice
+            .as_ref()
+            .filter(|n| Instant::now() < n.expires)
+            .map(|n| n.text.as_str())
+    }
+
+    // ─── clipboard ───────────────────────────────────────────────────────────
+
+    /// Copy the active selection to the system clipboard.
+    pub fn copy_selection(&mut self) {
+        let Some(tab) = self.manager.active_tab() else {
+            return;
+        };
+        if !self.session.selection.is_active() {
+            self.notify("No selection");
+            return;
+        }
+        let Some(text) = tab.selection_text(&self.session.selection) else {
+            self.notify("No selection");
+            return;
+        };
+        if text.is_empty() {
+            self.notify("Selection is empty");
+            return;
+        }
+        let n = text.chars().count();
+        match self.clipboard.store(ClipboardKind::Clipboard, &text) {
+            Ok(()) => self.notify(format!("Copied {n} chars")),
+            Err(e) => self.notify(format!("Copy failed: {e}")),
+        }
+    }
+
+    /// Load the given clipboard and paste it into the terminal(s).
+    pub fn paste(&mut self, kind: ClipboardKind) {
+        match self.clipboard.load(kind) {
+            Ok(text) => self.deliver_paste(&text),
+            Err(e) => self.notify(format!("Paste failed: {e}")),
+        }
+    }
+
+    /// Sanitize, optionally bracket, and route already-loaded paste text.
+    ///
+    /// Shared by the clipboard-tool path, OSC 52 paste requests, and host
+    /// terminal paste events.
+    pub fn deliver_paste(&mut self, text: &str) {
+        let clean = sanitize_paste(text);
+        if clean.is_empty() {
+            self.notify("Clipboard is empty");
+            return;
+        }
+        let n = clean.chars().count();
+        let bracketed = self
+            .manager
+            .active_tab()
+            .map(|t| t.bracketed_paste())
+            .unwrap_or(false);
+        let payload = if bracketed { bracket(&clean) } else { clean };
+        if let Err(e) = self.manager.route_input(payload.as_bytes()) {
+            log::warn!("paste routing failed: {e}");
+        }
+        self.notify(format!("Pasted {n} chars"));
+    }
+
+    // ─── commands ────────────────────────────────────────────────────────────
 
     /// Apply a one-shot [`Command`] (from the palette, a macro, etc.).
     pub fn run_command(&mut self, cmd: &Command, cols: u16, rows: u16) -> InputAction {
@@ -125,8 +231,26 @@ impl App {
                 self.quit = true;
                 InputAction::Quit
             }
+            Command::CopySelection => {
+                self.copy_selection();
+                InputAction::Handled
+            }
+            Command::PasteClipboard => {
+                self.paste(ClipboardKind::Clipboard);
+                InputAction::Handled
+            }
+            Command::PastePrimary => {
+                self.paste(ClipboardKind::Primary);
+                InputAction::Handled
+            }
             other => {
+                let active_before = self.manager.active;
                 let action = self.manager.execute(other, cols, rows, &self.config);
+                // Switching tabs invalidates the selection (it lives in the
+                // previous tab's grid coordinates).
+                if self.manager.active != active_before {
+                    self.session.reset();
+                }
                 if action == Action::Quit {
                     self.quit = true;
                     InputAction::Quit
@@ -153,11 +277,8 @@ impl App {
             }
             AppEvent::FocusGained | AppEvent::FocusLost => InputAction::Continue,
             AppEvent::Paste(s) => {
-                // Paste as raw bytes into the active tab (or broadcast group).
-                let bytes = s.into_bytes();
-                if let Err(e) = self.manager.route_input(&bytes) {
-                    log::warn!("input routing failed: {e}");
-                }
+                // Paste delivered by the host terminal (bracketed paste).
+                self.deliver_paste(&s);
                 InputAction::Continue
             }
             AppEvent::Mouse(m) => self.handle_mouse(m),
@@ -170,21 +291,32 @@ impl App {
 
     /// Handle a mouse event.
     ///
-    /// If the active program has enabled mouse reporting (via DECSET), the
-    /// event is encoded and sent to the PTY. Otherwise, the event drives
-    /// local text selection: press begins a selection, motion extends it,
-    /// release copies to clipboard (deferred — clipboard access requires
-    /// platform-specific code).
-    pub fn handle_mouse(&mut self, ev: crate::ui::event::AppMouseEvent) -> InputAction {
+    /// Priority order (matching xterm/Ghostty behavior):
+    /// 1. If the child enabled mouse reporting and Shift is not held,
+    ///    encode the event (SGR-1006 when negotiated, else legacy X11) and
+    ///    forward it to the PTY. Shift bypasses reporting so the user can
+    ///    always select text.
+    /// 2. Otherwise the event drives local interaction: click-drag selects
+    ///    (with double/triple-click word/line modes), the wheel scrolls
+    ///    the scrollback viewport (or sends arrows on the alternate
+    ///    screen), middle-click pastes the primary selection, and
+    ///    right-click pastes the clipboard.
+    pub fn handle_mouse(&mut self, ev: AppMouseEvent) -> InputAction {
         let mouse_ev: MouseEvent = ev.into();
-        let mode = self.session.mouse_mode;
+        let mode = self
+            .manager
+            .active_tab()
+            .map(|t| t.mouse_mode())
+            .unwrap_or_default();
 
-        // If the program is reporting mouse events, encode and forward.
-        if mode.any_reporting() {
-            // Try SGR-1006 first (preferred), then legacy X11.
-            if let Some(bytes) = crate::mouse::encode_sgr(mouse_ev, mode)
-                .or_else(|| crate::mouse::encode_x11(mouse_ev, mode))
-            {
+        // 1. Mouse reporting for the child program.
+        if mode.any_reporting() && !mouse_ev.mods.shift {
+            let bytes = if mode.sgr {
+                crate::mouse::encode_sgr(mouse_ev, mode)
+            } else {
+                crate::mouse::encode_x11(mouse_ev, mode)
+            };
+            if let Some(bytes) = bytes {
                 if let Err(e) = self.manager.route_input(&bytes) {
                     log::warn!("input routing failed: {e}");
                 }
@@ -192,35 +324,191 @@ impl App {
             }
         }
 
-        // Otherwise, drive local selection.
-        match mouse_ev.kind {
-            MouseEventKind::Press => match mouse_ev.button {
-                MouseButton::Left => {
-                    self.session.selection.begin(mouse_ev.col, mouse_ev.row);
-                }
-                MouseButton::Right => {
-                    // Right-click: paste (placeholder — would call into clipboard).
-                    self.session.selection.clear();
-                }
-                _ => {}
-            },
-            MouseEventKind::Motion => {
-                if self.session.selection.is_active() {
-                    self.session.selection.extend(mouse_ev.col, mouse_ev.row);
+        // 2. Local interaction.
+        let now = Instant::now();
+        match (mouse_ev.kind, mouse_ev.button) {
+            (MouseEventKind::Press, MouseButton::WheelUp) => {
+                if let Some(t) = self.manager.active_tab_mut() {
+                    t.wheel_scroll(true);
                 }
             }
-            MouseEventKind::Release => {
-                if self.session.selection.is_multi_cell() {
-                    // Selection complete — would copy to clipboard here.
-                    // For now we just leave the selection active so the
-                    // renderer can highlight it; the user can clear it
-                    // with a single click.
-                } else {
-                    self.session.selection.clear();
+            (MouseEventKind::Press, MouseButton::WheelDown) => {
+                if let Some(t) = self.manager.active_tab_mut() {
+                    t.wheel_scroll(false);
                 }
             }
+            (MouseEventKind::Press, MouseButton::Left) => {
+                self.begin_selection(mouse_ev, now);
+            }
+            (MouseEventKind::Motion, _) if self.session.selection.is_active() => {
+                self.extend_selection(mouse_ev);
+            }
+            (MouseEventKind::Release, MouseButton::Left) => {
+                self.finish_selection();
+            }
+            (MouseEventKind::Press, MouseButton::Middle) => {
+                self.paste(ClipboardKind::Primary);
+            }
+            (MouseEventKind::Press, MouseButton::Right) => {
+                self.paste(ClipboardKind::Clipboard);
+            }
+            _ => {}
         }
         InputAction::Handled
+    }
+
+    /// Left-press: start a Simple/Word/Line selection based on click cadence.
+    fn begin_selection(&mut self, ev: MouseEvent, now: Instant) {
+        let Some(tab) = self.manager.active_tab() else { return };
+        let p = tab.grid_point(ev.row, ev.col);
+        let kind = self.session.clicks.register(now);
+        match kind {
+            crate::mouse::SelectionKind::Word => {
+                let (a, b) = tab.expand_word(p);
+                self.session.selection.set_span(kind, a, b);
+            }
+            crate::mouse::SelectionKind::Line => {
+                let (a, b) = tab.expand_line(p);
+                self.session.selection.set_span(kind, a, b);
+            }
+            crate::mouse::SelectionKind::Simple => {
+                self.session.selection.begin(kind, p);
+            }
+        }
+    }
+
+    /// Drag: extend the selection, re-expanding word/line selections.
+    fn extend_selection(&mut self, ev: MouseEvent) {
+        let Some(tab) = self.manager.active_tab() else { return };
+        let p = tab.grid_point(ev.row, ev.col);
+        let kind = self.session.selection.kind;
+        match kind {
+            crate::mouse::SelectionKind::Simple => {
+                self.session.selection.extend(p);
+            }
+            crate::mouse::SelectionKind::Word => {
+                // Union of the anchor word and the word under the pointer.
+                let origin = self
+                    .session
+                    .selection
+                    .anchor
+                    .or(Some(p))
+                    .unwrap_or(p);
+                let (aa, ab) = tab.expand_word(origin);
+                let (ba, bb) = tab.expand_word(p);
+                let lo = if (ba.line, ba.col) < (aa.line, aa.col) { ba } else { aa };
+                let hi = if (bb.line, bb.col) > (ab.line, ab.col) { bb } else { ab };
+                self.session.selection.set_span(kind, lo, hi);
+            }
+            crate::mouse::SelectionKind::Line => {
+                let origin = self.session.selection.anchor.unwrap_or(p);
+                let lo_line = origin.line.min(p.line);
+                let hi_line = origin.line.max(p.line);
+                let cols = tab.size().0 as usize;
+                self.session.selection.set_span(
+                    kind,
+                    SelPoint { line: lo_line, col: 0 },
+                    SelPoint { line: hi_line, col: cols.saturating_sub(1) },
+                );
+            }
+        }
+    }
+
+    /// Left-release: copy-on-select (if enabled), collapse empty selections.
+    fn finish_selection(&mut self) {
+        let sel = &self.session.selection;
+        if sel.is_active() && (sel.is_multi_cell() || sel.kind != crate::mouse::SelectionKind::Simple)
+        {
+            if self.config.clipboard.copy_on_select {
+                if let Some(tab) = self.manager.active_tab() {
+                    if let Some(text) = tab.selection_text(sel) {
+                        if !text.is_empty() {
+                            let n = text.chars().count();
+                            // Copy-on-select targets the primary selection
+                            // (X11 convention) and the clipboard (so it also
+                            // works on Wayland/macOS setups).
+                            if let Err(e) =
+                                self.clipboard.store(ClipboardKind::Primary, &text)
+                            {
+                                log::debug!("primary store failed: {e}");
+                            }
+                            if let Err(e) =
+                                self.clipboard.store(ClipboardKind::Clipboard, &text)
+                            {
+                                log::debug!("clipboard store failed: {e}");
+                            }
+                            self.notify(format!("Copied {n} chars"));
+                        }
+                    }
+                }
+            }
+        } else {
+            self.session.selection.clear();
+        }
+    }
+
+    // ─── VT events from the child (title, OSC 52, bell, …) ───────────────────
+
+    /// Process VT events drained from the tabs after a PTY poll.
+    pub fn handle_tab_events(&mut self, events: Vec<(usize, TermEvent)>) {
+        for (idx, ev) in events {
+            self.handle_tab_event(idx, ev);
+        }
+    }
+
+    fn handle_tab_event(&mut self, idx: usize, ev: TermEvent) {
+        match ev {
+            TermEvent::Title(title) => {
+                self.manager.set_title(idx, title);
+            }
+            TermEvent::ResetTitle => {
+                self.manager.reset_title(idx);
+            }
+            TermEvent::ClipboardStore(ty, text) => {
+                // A program (tmux, nvim, …) set the clipboard via OSC 52.
+                // Allow list-sized writes; refuse absurd ones.
+                if text.len() > crate::clipboard::OSC52_MAX_BYTES {
+                    log::warn!(
+                        "ignoring OSC 52 store from tab {idx}: {} bytes exceeds cap",
+                        text.len()
+                    );
+                    return;
+                }
+                let kind = ClipboardKind::from(ty);
+                if let Err(e) = self.clipboard.store(kind, &text) {
+                    log::debug!("OSC 52 store failed: {e}");
+                }
+            }
+            TermEvent::ClipboardLoad(ty, fmt) => {
+                // OSC 52 clipboard *query*. Off by default (security: don't
+                // let arbitrary programs read the clipboard silently).
+                if !self.config.clipboard.osc52_read {
+                    return;
+                }
+                let kind = ClipboardKind::from(ty);
+                if let Ok(text) = self.clipboard.load(kind) {
+                    let seq = fmt(&text);
+                    if let Some(tab) = self.manager.tabs.get_mut(idx) {
+                        if let Err(e) = tab.write_input(seq.as_bytes()) {
+                            log::debug!("OSC 52 paste write failed: {e}");
+                        }
+                    }
+                }
+            }
+            TermEvent::PtyWrite(s) => {
+                if let Some(tab) = self.manager.tabs.get_mut(idx) {
+                    if let Err(e) = tab.write_input(s.as_bytes()) {
+                        log::debug!("PtyWrite failed: {e}");
+                    }
+                }
+            }
+            TermEvent::Bell => {
+                self.notify("Bell");
+            }
+            // Wakeup, MouseCursorDirty, … — the 20 Hz render loop already
+            // covers redraws; nothing to do.
+            _ => {}
+        }
     }
 
     /// Handle an [`AppKeyEvent`] (translated from crossterm or winit).
@@ -377,8 +665,12 @@ impl App {
     fn main_loop(&mut self, renderer: &mut dyn crate::ui::Renderer) -> anyhow::Result<()> {
         let poll_ms = 50; // 20 Hz input poll; PTY drain is per-tick.
         while !self.quit {
-            // 1. Drain PTYs.
+            // 1. Drain PTYs, then act on VT events (titles, OSC 52, bells).
             let (_active_changed, _any_eof) = self.manager.poll_all();
+            let events = self.manager.drain_events();
+            if !events.is_empty() {
+                self.handle_tab_events(events);
+            }
 
             // 2. Poll for input.
             while let Some(ev) = renderer.poll_event(poll_ms)? {
@@ -444,6 +736,7 @@ fn app_key_to_crossterm(ev: AppKeyEvent) -> KeyEvent {
 mod tests {
     use super::*;
     use crate::cli::Cli;
+    use alacritty_terminal::grid::Dimensions;
     use clap::Parser;
 
     fn default_cli() -> Cli {
@@ -570,5 +863,295 @@ mod tests {
         let action = app.handle_event(AppEvent::Key(ev), 40, 10);
         assert_eq!(action, InputAction::OpenPalette);
         assert!(app.palette.is_open());
+    }
+
+    // ─── clipboard + selection + scrolling tests ──────────────────────────
+
+    use crate::clipboard::MockClipboard;
+    use crate::ui::event::AppMouseEvent;
+
+    fn mock_app() -> App {
+        let cli = default_cli();
+        let cfg = Config::default();
+        App::with_clipboard(cli, cfg, Box::new(MockClipboard::new())).unwrap()
+    }
+
+    /// Replace the app's tabs with one child running `cmd`, then wait for
+    /// `marker` (printed after `cmd`) to appear in its grid. Only suitable
+    /// for one-shot commands; interactive children (`cat`) need a manual
+    /// profile that prints the marker first.
+    fn run_child(app: &mut App, cmd: &str, marker: &str) {
+        let profile = crate::config::Profile {
+            command: vec!["sh".into(), "-c".into(), format!("{cmd}; printf '{marker}'")],
+            ..crate::config::Profile::default()
+        };
+        while !app.manager.tabs.is_empty() {
+            app.manager.close_tab(0);
+        }
+        app.manager.open_tab(&profile, Some("test".into()), 40, 10).unwrap();
+        wait_grid(app, marker);
+    }
+
+    /// Like [`run_child`], but the marker is printed *before* the (long
+    /// running) command starts — for interactive children like `cat`.
+    fn run_interactive_child(app: &mut App, cmd: &str, marker: &str) {
+        let profile = crate::config::Profile {
+            command: vec!["sh".into(), "-c".into(), format!("printf '{marker}'; {cmd}")],
+            ..crate::config::Profile::default()
+        };
+        while !app.manager.tabs.is_empty() {
+            app.manager.close_tab(0);
+        }
+        app.manager.open_tab(&profile, Some("test".into()), 40, 10).unwrap();
+        wait_grid(app, marker);
+    }
+
+    /// Wait until the active tab's grid contains `needle`.
+    ///
+    /// VT events parsed along the way stay queued in the tab — tests pick
+    /// them up with `manager.drain_events()` afterwards.
+    fn wait_grid(app: &mut App, needle: &str) {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline {
+            let _ = app.manager.poll_all();
+            let tab = app.manager.active_tab().unwrap();
+            let grid = tab.term.grid();
+            let start = -(grid.display_offset() as i32);
+            let found = (0..grid.screen_lines()).any(|r| {
+                let s: String = (0..grid.columns())
+                    .map(|c| {
+                        grid[crate::Point {
+                            line: crate::Line(start + r as i32),
+                            column: crate::Column(c),
+                        }].c
+                    })
+                    .collect();
+                s.contains(needle)
+            });
+            if found {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        panic!("timeout waiting for {needle:?} in grid");
+    }
+
+    fn mouse_ev(
+        button: crate::mouse::MouseButton,
+        col: u32,
+        row: u32,
+        kind: MouseEventKind,
+    ) -> AppMouseEvent {
+        AppMouseEvent {
+            button,
+            col,
+            row,
+            mods: crate::mouse::MouseMods::default(),
+            kind,
+        }
+    }
+
+    #[test]
+    fn drag_select_then_release_copies_on_select() {
+        let mut app = mock_app();
+        run_child(&mut app, "printf 'alpha beta gamma'", "MARK1");
+        // Drag from col 6 to col 9 on row 0 → "beta".
+        app.handle_event(AppEvent::Mouse(mouse_ev(
+            crate::mouse::MouseButton::Left,
+            6,
+            0,
+            MouseEventKind::Press,
+        )), 40, 10);
+        app.handle_event(AppEvent::Mouse(mouse_ev(
+            crate::mouse::MouseButton::Left,
+            9,
+            0,
+            MouseEventKind::Motion,
+        )), 40, 10);
+        app.handle_event(AppEvent::Mouse(mouse_ev(
+            crate::mouse::MouseButton::Left,
+            9,
+            0,
+            MouseEventKind::Release,
+        )), 40, 10);
+
+        let any = app.clipboard.as_any().unwrap();
+        let mock = any.downcast_ref::<MockClipboard>().unwrap();
+        let stored = mock
+            .stores
+            .iter()
+            .find(|(k, _)| matches!(k, crate::clipboard::ClipboardKind::Clipboard))
+            .map(|(_, t)| t.clone())
+            .expect("copy-on-select should store to clipboard");
+        assert_eq!(stored, "beta");
+    }
+
+    #[test]
+    fn single_click_does_not_copy() {
+        let mut app = mock_app();
+        run_child(&mut app, "printf 'alpha beta gamma'", "MARK2");
+        // Click and release on the same cell — no multi-cell selection.
+        app.handle_event(AppEvent::Mouse(mouse_ev(
+            crate::mouse::MouseButton::Left,
+            3,
+            0,
+            MouseEventKind::Press,
+        )), 40, 10);
+        app.handle_event(AppEvent::Mouse(mouse_ev(
+            crate::mouse::MouseButton::Left,
+            3,
+            0,
+            MouseEventKind::Release,
+        )), 40, 10);
+        let any = app.clipboard.as_any().unwrap();
+        let mock = any.downcast_ref::<MockClipboard>().unwrap();
+        assert!(mock.stores.is_empty(), "single click must not copy");
+    }
+
+    #[test]
+    fn right_click_pastes_clipboard() {
+        let mut app = mock_app();
+        run_interactive_child(&mut app, "cat", "MARK3");
+        app.clipboard = Box::new(MockClipboard::with_content(
+            crate::clipboard::ClipboardKind::Clipboard,
+            "pasted-by-right-click",
+        ));
+        app.handle_event(
+            AppEvent::Mouse(mouse_ev(
+                crate::mouse::MouseButton::Right,
+                1,
+                1,
+                MouseEventKind::Press,
+            )),
+            40,
+            10,
+        );
+        // `cat` echoes the paste back into the grid.
+        wait_grid(&mut app, "pasted-by-right");
+        assert!(app.active_notice().is_some());
+    }
+
+    #[test]
+    fn paste_command_reaches_bracketed_child() {
+        let mut app = mock_app();
+        run_interactive_child(&mut app, "printf '\\033[?2004h'; cat", "MARK4");
+        assert!(
+            app.manager.active_tab().unwrap().bracketed_paste(),
+            "child should have bracketed paste on"
+        );
+        app.clipboard = Box::new(MockClipboard::with_content(
+            crate::clipboard::ClipboardKind::Clipboard,
+            "bracketed-text",
+        ));
+        app.run_command(&Command::PasteClipboard, 40, 10);
+        wait_grid(&mut app, "bracketed-text");
+        assert!(app.active_notice().unwrap().contains("Pasted"));
+    }
+
+    #[test]
+    fn wheel_scrolls_active_tab_and_typing_snaps_back() {
+        let mut app = mock_app();
+        run_child(&mut app, "seq 1 200", "MARK5");
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline {
+            let _ = app.manager.poll_all();
+            if app.manager.active_tab().unwrap().term.grid().history_size() > 100 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        app.handle_event(
+            AppEvent::Mouse(mouse_ev(
+                crate::mouse::MouseButton::WheelUp,
+                0,
+                0,
+                MouseEventKind::Press,
+            )),
+            40,
+            10,
+        );
+        assert_eq!(app.manager.active_tab().unwrap().display_offset(), 3);
+        // Typing snaps back to the bottom.
+        app.handle_event(
+            AppEvent::Key(AppKeyEvent::new(AppModifiers::empty(), AppKey::Enter)),
+            40,
+            10,
+        );
+        assert!(app.manager.active_tab().unwrap().at_bottom());
+    }
+
+    #[test]
+    fn mouse_reporting_forwards_to_child_and_shift_bypasses() {
+        let mut app = mock_app();
+        run_child(&mut app, "printf '\\033[?1000h\\033[?1006h'", "MARK6");
+
+        // Non-shift press is encoded and forwarded (not treated as selection).
+        app.handle_event(
+            AppEvent::Mouse(mouse_ev(
+                crate::mouse::MouseButton::Left,
+                5,
+                2,
+                MouseEventKind::Press,
+            )),
+            40,
+            10,
+        );
+        assert!(
+            !app.session.selection.is_active(),
+            "press should go to child, not selection"
+        );
+
+        // Shift+click bypasses reporting → local selection begins.
+        let mut ev = mouse_ev(crate::mouse::MouseButton::Left, 1, 1, MouseEventKind::Press);
+        ev.mods.shift = true;
+        app.handle_event(AppEvent::Mouse(ev), 40, 10);
+        assert!(app.session.selection.is_active());
+    }
+
+    #[test]
+    fn osc52_store_from_child_sets_clipboard() {
+        let mut app = mock_app();
+        // "prox" base64-encodes to cHJveA==.
+        run_child(&mut app, "printf '\\033]52;c;cHJveA==\\007'", "MARK7");
+        let events = app.manager.drain_events();
+        assert!(!events.is_empty());
+        app.handle_tab_events(events);
+        let stored = app
+            .clipboard
+            .load(crate::clipboard::ClipboardKind::Clipboard)
+            .unwrap();
+        assert_eq!(stored, "prox");
+    }
+
+    #[test]
+    fn title_from_child_renames_tab() {
+        let mut app = mock_app();
+        run_child(&mut app, "printf '\\033]0;renamed-tab\\007'", "MARK8");
+        let events = app.manager.drain_events();
+        app.handle_tab_events(events);
+        assert_eq!(app.manager.active_tab().unwrap().title, "renamed-tab");
+    }
+
+    #[test]
+    fn tab_switch_clears_selection() {
+        let mut app = mock_app();
+        app.run_command(&Command::NewTab, 40, 10);
+        assert_eq!(app.manager.tabs.len(), 2);
+        app.session.selection.begin(
+            crate::mouse::SelectionKind::Simple,
+            crate::mouse::SelPoint { line: 0, col: 0 },
+        );
+        app.run_command(&Command::PrevTab, 40, 10);
+        assert!(
+            !app.session.selection.is_active(),
+            "selection must reset on tab switch"
+        );
+    }
+
+    #[test]
+    fn copy_without_selection_notifies() {
+        let mut app = mock_app();
+        app.run_command(&Command::CopySelection, 40, 10);
+        assert_eq!(app.active_notice(), Some("No selection"));
     }
 }

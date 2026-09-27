@@ -60,6 +60,9 @@ pub struct Config {
     /// backend (wgpu or softbuffer). Ignored by the TUI backend.
     #[serde(default)]
     pub transparency: TransparencyConfig,
+    /// Clipboard (copy/paste) configuration.
+    #[serde(default)]
+    pub clipboard: ClipboardConfig,
     /// GPU detection and rendering configuration.
     ///
     /// Controls how the wgpu backend probes for hardware and what
@@ -67,6 +70,41 @@ pub struct Config {
     /// with `--features gpu`.
     #[serde(default)]
     pub gpu: GpuConfig,
+}
+
+/// Clipboard behavior configuration (`[clipboard]` in config.toml).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClipboardConfig {
+    /// Copy the selection to the clipboard as soon as the mouse button is
+    /// released (classic xterm/mrxvt behavior).
+    #[serde(default = "default_true")]
+    pub copy_on_select: bool,
+    /// Mirror every copy to the host terminal via OSC 52. This is what
+    /// makes copy work over SSH — the *client's* terminal performs the
+    /// clipboard write.
+    #[serde(default = "default_true")]
+    pub osc52: bool,
+    /// Allow programs inside the terminal to *read* the clipboard via
+    /// OSC 52 queries (DECSET-style paste requests from tmux/nvim).
+    /// Disabled by default, matching xterm's secure default; copying
+    /// *out* is always allowed.
+    #[serde(default)]
+    pub osc52_read: bool,
+    /// Explicit clipboard tool to use (`"xclip"`, `"xsel"`, `"wl-copy"`).
+    /// Empty = auto-detect in priority order.
+    #[serde(default)]
+    pub tool: Option<String>,
+}
+
+impl Default for ClipboardConfig {
+    fn default() -> Self {
+        Self {
+            copy_on_select: true,
+            osc52: true,
+            osc52_read: false,
+            tool: None,
+        }
+    }
 }
 
 /// Transparency config (re-exported here so users don't need to import from
@@ -150,6 +188,7 @@ impl Default for Config {
             default_profile: default_profile(),
             macros: HashMap::new(),
             transparency: TransparencyConfig::default(),
+            clipboard: ClipboardConfig::default(),
             gpu: GpuConfig::default(),
         }
     }
@@ -238,7 +277,7 @@ fn default_shell() -> String {
 }
 
 /// A named profile. The `default` profile is consulted when no `--exec` is given.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Profile {
     /// Command line (split on whitespace; no shell semantics).
     /// If empty, falls back to `terminal.shell`.
@@ -250,9 +289,32 @@ pub struct Profile {
     /// Optional tag for grouped broadcasting.
     #[serde(default)]
     pub tag: Option<String>,
-    /// Environment overrides (`KEY=value`).
+    /// Environment overrides (`KEY=value`). Applied after the inherited
+    /// environment and after the built-in `TERM`/`COLORTERM` defaults, so
+    /// profiles can override them.
     #[serde(default)]
     pub env: HashMap<String, String>,
+    /// When `command` is empty (default shell), run it as a **login shell**
+    /// (argv0 `-bash`). Login shells source `/etc/profile` and
+    /// `~/.bash_profile`, which is where distros export the GUI session
+    /// environment (D-Bus address, flatpak/snap paths, XDG data dirs).
+    /// This is the classic mrxvt default (`loginShell: True`) and it is
+    /// what makes GUI apps launched from rs-mrxvt find their display
+    /// environment. Only meaningful for the default shell.
+    #[serde(default = "default_true")]
+    pub login_shell: bool,
+}
+
+impl Default for Profile {
+    fn default() -> Self {
+        Self {
+            command: Vec::new(),
+            cwd: None,
+            tag: None,
+            env: HashMap::new(),
+            login_shell: true,
+        }
+    }
 }
 
 /// Abstraction over config sources so we can later swap TOML for Lua without
@@ -300,9 +362,8 @@ impl Config {
     /// file extension (`.lua` → Lua, `.toml` or anything else → TOML).
     pub fn load(path: Option<&Path>) -> Result<Self> {
         #[cfg(feature = "lua")]
-        {
-            return crate::config_lua::load_config_smart(path);
-        }
+        return crate::config_lua::load_config_smart(path);
+
         #[cfg(not(feature = "lua"))]
         {
             let path = path.map(|p| p.to_path_buf()).unwrap_or_else(Self::default_path);
@@ -321,6 +382,7 @@ impl Config {
                 cwd: None,
                 tag: None,
                 env: HashMap::new(),
+                login_shell: true,
             },
         })
     }

@@ -151,6 +151,17 @@ pub fn parse_lua_config(source: &str) -> Result<Config> {
         };
     }
 
+    // clipboard = { copy_on_select = bool, osc52 = bool, osc52_read = bool, tool = "..." }
+    if let Some(Value::Table(t)) = opt_value(&table, "clipboard") {
+        let d = crate::config::ClipboardConfig::default();
+        cfg.clipboard = crate::config::ClipboardConfig {
+            copy_on_select: opt_bool(&t, "copy_on_select").unwrap_or(d.copy_on_select),
+            osc52: opt_bool(&t, "osc52").unwrap_or(d.osc52),
+            osc52_read: opt_bool(&t, "osc52_read").unwrap_or(d.osc52_read),
+            tool: opt_string(&t, "tool").or(d.tool),
+        };
+    }
+
     // default_profile = "..."
     if let Some(s) = opt_string(&table, "default_profile") {
         cfg.default_profile = s;
@@ -166,6 +177,7 @@ pub fn parse_lua_config(source: &str) -> Result<Config> {
                 let cwd = opt_string(&pt, "cwd").map(PathBuf::from);
                 let tag = opt_string(&pt, "tag");
                 let env = opt_string_map(&pt, "env").unwrap_or_default();
+                let login_shell = opt_bool(&pt, "login_shell").unwrap_or(true);
                 cfg.profiles.insert(
                     k,
                     Profile {
@@ -173,6 +185,7 @@ pub fn parse_lua_config(source: &str) -> Result<Config> {
                         cwd,
                         tag,
                         env,
+                        login_shell,
                     },
                 );
             }

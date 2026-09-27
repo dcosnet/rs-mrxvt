@@ -28,6 +28,29 @@ Three opt-in feature flags extend the terminal in orthogonal directions:
 - **Multi-tab PTY** — each tab runs an independent shell via `portable-pty`,
   with VT emulation by `alacritty_terminal`. Tabs are managed by a single
   `TerminalManager`; one tab's heavy output never blocks the others.
+- **Copy & paste** — click-drag select (line-based, like xterm/Ghostty),
+  double-click word, triple-click line. `Ctrl+Shift+C`/`Ctrl+Shift+V`,
+  classic `Ctrl+Ins`/`Shift+Ins`, middle-click pastes the primary
+  selection, right-click pastes the clipboard, and copy-on-select follows
+  the classic mrxvt/xterm behavior. Copies are also mirrored to the host
+  terminal via **OSC 52**, so copy works over SSH.
+- **Scrollback navigation** — mouse wheel, `Shift+PageUp/PageDown`,
+  `Shift+Home/End`, and palette commands. The wheel does the right thing
+  on the alternate screen (sends arrows to `less`/`vim`); typing snaps the
+  viewport back to the live bottom.
+- **Mouse reporting** — DECSET 9/1000/1002/1003/1006 tracked from the
+  child program; SGR-1006 and legacy X11 encodings both supported.
+  `Shift+click` always bypasses reporting so you can select text in
+  `vim`/`htop`.
+- **OSC 52 in and out** — programs (tmux, nvim) can set the clipboard;
+  reads are off by default for security (`clipboard.osc52_read = true`
+  to enable).
+- **Dynamic tab titles** — OSC 0/2 title sequences from the child rename
+  the tab (e.g. `vim` shows the filename, `ssh` shows the host).
+- **Login shells by default** — default-shell tabs run as login shells
+  (classic mrxvt `loginShell: True`), so `/etc/profile` and its distro
+  GUI-session exports (D-Bus, flatpak/snap paths) reach every app you
+  launch — including GUI apps.
 - **Input Broadcasting** — the classic mrxvt killer feature. Toggle
   broadcast-to-all with `Ctrl+Shift+I`, or broadcast only to tagged groups
   via `--tag` on the CLI or the `ToggleBroadcastGroup` command in the
@@ -42,7 +65,7 @@ Three opt-in feature flags extend the terminal in orthogonal directions:
 - **TOML config** — `~/.config/rs-mrxvt/config.toml` with profiles, macros,
   keybindings, and transparency settings.
 - **Per-tab fading** — inactive tabs dim smoothly via a lerp animation.
-- **Stress-tested** — 89+ unit + integration tests, plus a 50-instance
+- **Stress-tested** — 200+ unit + integration tests, plus a 50-instance
   Python stress harness that broadcasts a marker to 50 shells in ~30ms.
 
 ### With `--features lua`
@@ -87,15 +110,19 @@ Three opt-in feature flags extend the terminal in orthogonal directions:
 | Config hot-reload      | ✅ shipped  | Polling watcher, survives bad configs          |
 | iTerm2 image protocol  | ✅ shipped  | PNG/JPEG/GIF/WebP/BMP inline                   |
 | Sixel image protocol   | ✅ shipped  | Pure-Rust parser, color registers, repeats     |
-| Mouse + SGR-1006       | ✅ shipped  | X10/X11/SGR encoders, selection state machine  |
+| Mouse + SGR-1006       | ✅ shipped  | X10/X11/SGR encoders, shift-bypass selection   |
 | OSC 8 hyperlinks       | ✅ shipped  | Parser + scanner + cell-indexed store          |
 | Alt+N / Alt+Arrows     | ✅ shipped  | New tab, shuffle forward/back                  |
 | Alt+Shift+X close      | ✅ shipped  | Closes focused tab                             |
 | Alt+Z zsh tab          | ✅ shipped  | Secondary shell on a hotkey                    |
 | True-color themes      | ✅ shipped  | Tokyo Night, Gruvbox, Dracula, Solarized       |
 | Multi-distro sysprep   | ✅ shipped  | pacman/apt/dnf/zypper/xbps/apk/cast/emerge     |
-| Renderer integration   | 🚧 planned  | Wire mouse/selection/links/images into UI loop |
-| Clipboard support      | 🚧 planned  | Copy selection, paste on right-click           |
+| Clipboard              | ✅ shipped  | Select/copy/paste, OSC 52 mirror, tools+mock   |
+| Scrollback navigation  | ✅ shipped  | Wheel, Shift+PgUp/PgDn/Home/End, palette cmds  |
+| Selection modes        | ✅ shipped  | Drag/word/line, copy-on-select, highlight      |
+| Tab title sync         | ✅ shipped  | OSC 0/2 from child renames the tab             |
+| Login shells           | ✅ shipped  | GUI-session env reaches apps (mrxvt default)   |
+| GUI backend polish     | 🚧 planned  | Selection/cursor highlight in wgpu+soft UIs    |
 
 ## 🚀 Quick start
 
@@ -147,15 +174,25 @@ sudo PREFIX=/usr make install  # installs to /usr
 
 | Shortcut              | Action                                        |
 |-----------------------|-----------------------------------------------|
-| `Ctrl+Shift+T` / `Alt+N` | New tab (bash, the default shell)          |
+| `Ctrl+Shift+T` / `Alt+N` | New tab (login shell)                      |
 | `Alt+Z`               | New tab running zsh (secondary shell)         |
 | `Alt+Shift+X`         | Close the currently focused tab               |
 | `Ctrl+Shift+W`        | Close tab (classic mrxvt binding)             |
+| `Ctrl+Shift+C` / `Ctrl+Insert` | Copy selection to clipboard          |
+| `Ctrl+Shift+V` / `Shift+Insert` | Paste from clipboard                |
 | `Ctrl+Shift+I`        | Toggle broadcast (all tabs)                   |
 | `Ctrl+Shift+P`        | Open command palette                          |
 | `Ctrl+Tab` / `Alt+Right` | Next tab (wraps)                           |
 | `Ctrl+Shift+Tab` / `Alt+Left` | Previous tab (wraps)                  |
 | `Alt+1` … `Alt+0`     | Go to tab N (1..10)                           |
+| `Shift+PageUp` / `Shift+PageDown` | Scroll scrollback a page       |
+| `Shift+Home` / `Shift+End` | Jump to top / bottom of scrollback       |
+
+Mouse: drag selects, double-click selects a word, triple-click selects a
+line, release copies (copy-on-select), middle-click pastes the primary
+selection, right-click pastes the clipboard, and the wheel scrolls the
+scrollback (or the alternate-screen program). `Shift+click` bypasses
+application mouse reporting so you can always select text.
 
 All bindings are rebindable in `config.toml` or `config.lua`.
 
@@ -175,6 +212,29 @@ tint = "#004080"      # blue tint
 opacity = 0.85         # 1.0 = opaque, 0.0 = fully transparent
 # background_image = "/path/to/wallpaper.png"
 ```
+
+### Clipboard
+
+```toml
+[clipboard]
+copy_on_select = true   # selecting text copies it (classic mrxvt/xterm)
+osc52 = true            # mirror copies to the host terminal — works over SSH
+osc52_read = false      # let programs read the clipboard via OSC 52 (security)
+# tool = "xclip"        # force a tool; otherwise auto-detected
+```
+
+rs-mrxvt talks to the system clipboard through the standard tools
+(`xclip`/`xsel` on X11, `wl-clipboard` on Wayland, `pbcopy`/`pbpaste` on
+macOS, `termux-clipboard-*` on Android) — no clipboard library is linked.
+Every copy is *additionally* emitted as an OSC 52 escape sequence, so the
+**host terminal** performs the clipboard write too; over SSH with no
+local clipboard tool, that mirror is what makes copy work.
+
+Paste sanitation matches mainstream terminals: control characters that
+could inject escape sequences are stripped, CRLF is normalized to LF, and
+a single trailing newline is dropped so a paste doesn't auto-submit your
+command. When the child enabled bracketed paste (DECSET 2004), pastes are
+wrapped in `ESC[200~ … ESC[201~`.
 
 ### Time-based theme (Lua)
 
@@ -206,6 +266,25 @@ Built-in true-color themes (set `ui.theme` in your config):
 
 Custom themes can be defined in TOML — see `examples/config.toml` for the
 full color list (16 ANSI colors + bg/fg/cursor).
+
+## 🛠 Troubleshooting
+
+**GUI apps refuse to start from a tab** (`cannot open display`, D-Bus
+errors): default-shell tabs run **login shells**, which source
+`/etc/profile` — that's where distros export the GUI session environment
+(`DBUS_SESSION_BUS_ADDRESS`, flatpak/snap paths). If tabs still can't
+launch GUI apps, rs-mrxvt itself was probably started from a
+non-graphical context (plain TTY, `sudo`, a stripped service): the child
+environment is inherited, so there is no `DISPLAY`/`WAYLAND_DISPLAY` to
+inherit. Start rs-mrxvt from your graphical session, or set the variables
+yourself. rs-mrxvt logs a warning at spawn when this is the case. If your
+`~/.bash_profile` is noisy, per-profile `login_shell = false` restores
+plain non-login shells.
+
+**Copy works but paste doesn't (over SSH):** paste reads the *local*
+system clipboard, which needs a local tool (`xclip`, `xsel`,
+`wl-paste`). OSC 52 can only *write* the client's clipboard, not read it
+synchronously — that's a protocol limit, not a bug.
 
 ## 🧪 Testing
 

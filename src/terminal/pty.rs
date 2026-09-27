@@ -144,31 +144,73 @@ impl PtySession {
 }
 
 fn build_command(profile: &Profile, fallback_shell: &str) -> Result<CommandBuilder> {
-    let argv: Vec<String> = if profile.command.is_empty() {
-        vec![fallback_shell.to_string()]
+    let mut cmd = if profile.command.is_empty() {
+        // Default shell. A login shell (argv0 `-bash`) sources /etc/profile
+        // and ~/.bash_profile, where distros export the GUI session
+        // environment (D-Bus, flatpak/snap paths, XDG dirs). Without it,
+        // GUI apps launched from rs-mrxvt can fail to find their display
+        // environment. This matches the classic mrxvt `loginShell: True`
+        // default.
+        if profile.login_shell {
+            CommandBuilder::new_default_prog()
+        } else {
+            CommandBuilder::new(fallback_shell)
+        }
     } else {
-        profile.command.clone()
+        // Explicit command (`-e CMD`, profiles): plain exec, no login shell.
+        let mut cmd = CommandBuilder::new(&profile.command[0]);
+        for arg in &profile.command[1..] {
+            cmd.arg(arg);
+        }
+        cmd
     };
-
-    let prog = argv[0].clone();
-    let mut cmd = CommandBuilder::new(&prog);
-    argv[1..].iter().for_each(|arg| { cmd.arg(arg); });
 
     // Working directory.
     if let Some(cwd) = &profile.cwd {
         cmd.cwd(cwd);
     }
 
-    // Environment overrides.
+    // We are the terminal emulator, so we own TERM: advertise the
+    // emulation we actually provide. Set the defaults *before* profile
+    // env overrides so a profile can still override them.
+    cmd.env("TERM", "xterm-256color");
+    cmd.env("COLORTERM", "truecolor");
+
+    // Environment overrides (last, so they win — including over TERM).
     for (k, v) in &profile.env {
         cmd.env(k, v);
     }
 
-    // Inherit TERM so programs know they're talking to a colour terminal.
-    cmd.env("TERM", "xterm-256color");
-    cmd.env("COLORTERM", "truecolor");
+    warn_if_no_graphical_env(&cmd);
 
     Ok(cmd)
+}
+
+/// One-time diagnostic when the child environment has no display vars.
+///
+/// The environment is inherited from rs-mrxvt's own process, so if neither
+/// `DISPLAY` nor `WAYLAND_DISPLAY` is set, rs-mrxvt itself was started from
+/// a non-graphical context (TTY, stripped service, `sudo`), and every GUI
+/// app launched from its tabs will refuse to start. Tell the user once,
+/// instead of leaving them to wonder why `firefox` "refuses to run".
+fn warn_if_no_graphical_env(cmd: &CommandBuilder) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    let has_display = cmd
+        .get_env("DISPLAY")
+        .map(|v| !v.is_empty())
+        .unwrap_or(false);
+    let has_wayland = cmd
+        .get_env("WAYLAND_DISPLAY")
+        .map(|v| !v.is_empty())
+        .unwrap_or(false);
+    if !has_display && !has_wayland && !WARNED.swap(true, Ordering::Relaxed) {
+        log::warn!(
+            "neither DISPLAY nor WAYLAND_DISPLAY is set in the child environment; \
+             GUI apps launched from rs-mrxvt will not start \
+             (start rs-mrxvt from a graphical session)"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -176,6 +218,27 @@ mod tests {
     use super::*;
     use crate::config::Profile;
     use std::collections::HashMap;
+    use std::time::{Duration, Instant};
+
+    /// Read from the PTY until `needle` appears or the timeout hits.
+    fn read_until(session: &mut PtySession, needle: &str, timeout: Duration) -> String {
+        let deadline = Instant::now() + timeout;
+        let mut acc = String::new();
+        let mut buf = [0u8; 512];
+        while Instant::now() < deadline {
+            match session.reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    acc.push_str(&String::from_utf8_lossy(&buf[..n]));
+                    if acc.contains(needle) {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        acc
+    }
 
     #[test]
     fn build_command_uses_profile_command() {
@@ -184,6 +247,7 @@ mod tests {
             cwd: None,
             tag: None,
             env: HashMap::new(),
+            login_shell: false,
         };
         let _cmd = build_command(&p, "/bin/sh").unwrap();
     }
@@ -195,6 +259,96 @@ mod tests {
     }
 
     #[test]
+    fn default_shell_runs_as_login_shell() {
+        // Force sh as $SHELL so the login-shell path is deterministic
+        // (portable-pty resolves $SHELL from the builder env). The PTY echo
+        // shows the literal `MARK-$0`; the shell's own output expands it,
+        // so "MARK--" can only come from a login shell's argv0 ("‑sh").
+        let mut env = HashMap::new();
+        env.insert("SHELL".to_string(), "/bin/sh".to_string());
+        let p = Profile {
+            command: vec![],
+            cwd: None,
+            tag: None,
+            env,
+            login_shell: true,
+        };
+        let mut session = PtySession::spawn(&p, "/bin/sh", 40, 10).unwrap();
+        session.write_all(b"echo MARK-$0; exit\n").unwrap();
+        let out = read_until(&mut session, "MARK--", Duration::from_secs(5));
+        assert!(
+            out.contains("MARK--"),
+            "login shell should report $0 starting with '-', got: {out:?}"
+        );
+    }
+
+    #[test]
+    fn login_shell_can_be_disabled() {
+        let mut env = HashMap::new();
+        env.insert("SHELL".to_string(), "/bin/sh".to_string());
+        let p = Profile {
+            command: vec![],
+            cwd: None,
+            tag: None,
+            env,
+            login_shell: false,
+        };
+        let mut session = PtySession::spawn(&p, "/bin/sh", 40, 10).unwrap();
+        session.write_all(b"echo MARK-$0; exit\n").unwrap();
+        // Non-login: $0 is the plain path ("/bin/sh"), never dash-prefixed.
+        let out = read_until(&mut session, "MARK-/", Duration::from_secs(5));
+        assert!(
+            out.contains("MARK-/") && !out.contains("MARK--"),
+            "non-login shell should have a plain $0, got: {out:?}"
+        );
+    }
+
+    #[test]
+    fn child_env_matches_parent_for_display_vars() {
+        // Whatever display vars the parent has must reach the child —
+        // this is the invariant GUI apps depend on.
+        let p = Profile {
+            command: vec![
+                "sh".into(),
+                "-c".into(),
+                "printf 'D=%s|W=%s' \"${DISPLAY:-none}\" \"${WAYLAND_DISPLAY:-none}\"".into(),
+            ],
+            cwd: None,
+            tag: None,
+            env: HashMap::new(),
+            login_shell: false,
+        };
+        let mut session = PtySession::spawn(&p, "/bin/sh", 40, 10).unwrap();
+        let out = read_until(&mut session, "|W=", Duration::from_secs(5));
+        let want_display = std::env::var("DISPLAY").unwrap_or_else(|_| "none".into());
+        let want_wayland =
+            std::env::var("WAYLAND_DISPLAY").unwrap_or_else(|_| "none".into());
+        assert!(
+            out.contains(&format!("D={want_display}|W={want_wayland}")),
+            "child display env must match parent, got: {out:?}"
+        );
+    }
+
+    #[test]
+    fn profile_env_overrides_term() {
+        let mut env = HashMap::new();
+        env.insert("TERM".to_string(), "myterm-9".to_string());
+        let p = Profile {
+            command: vec!["sh".into(), "-c".into(), "printf 'T=%s' \"$TERM\"".into()],
+            cwd: None,
+            tag: None,
+            env,
+            login_shell: false,
+        };
+        let mut session = PtySession::spawn(&p, "/bin/sh", 40, 10).unwrap();
+        let out = read_until(&mut session, "T=", Duration::from_secs(5));
+        assert!(
+            out.contains("T=myterm-9"),
+            "profile env must override the built-in TERM, got: {out:?}"
+        );
+    }
+
+    #[test]
     fn spawn_echo_and_read_output() {
         // Spawns `sh -c 'echo hello; exit 0'` and reads "hello\n".
         let p = Profile {
@@ -202,6 +356,7 @@ mod tests {
             cwd: None,
             tag: None,
             env: HashMap::new(),
+            login_shell: false,
         };
         let mut session = PtySession::spawn(&p, "/bin/sh", 40, 10).unwrap();
         let mut buf = [0u8; 64];
@@ -227,6 +382,7 @@ mod tests {
             cwd: None,
             tag: None,
             env: HashMap::new(),
+            login_shell: false,
         };
         let mut session = PtySession::spawn(&p, "/bin/sh", 40, 10).unwrap();
 
@@ -265,6 +421,7 @@ mod tests {
             cwd: None,
             tag: None,
             env: HashMap::new(),
+            login_shell: false,
         };
         let mut session = PtySession::spawn(&p, "/bin/sh", 40, 10).unwrap();
 

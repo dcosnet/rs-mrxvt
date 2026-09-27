@@ -111,8 +111,8 @@ impl InlineImage {
             .read_image(&mut pixels)
             .map_err(ImageError::Decode)?;
 
-        let cell_width = (w + cell_w_px - 1) / cell_w_px;
-        let cell_height = (h + cell_h_px - 1) / cell_h_px;
+        let cell_width = w.div_ceil(cell_w_px);
+        let cell_height = h.div_ceil(cell_h_px);
 
         Ok(Self {
             pixels,
@@ -258,16 +258,8 @@ pub fn parse_iterm2_sequence(
             let key = &kv[..eq];
             let value = &kv[eq + 1..];
             match key {
-                "width" => {
-                    if value != "auto" {
-                        width_cells = value.parse().ok();
-                    }
-                }
-                "height" => {
-                    if value != "auto" {
-                        height_cells = value.parse().ok();
-                    }
-                }
+                "width" if value != "auto" => width_cells = value.parse().ok(),
+                "height" if value != "auto" => height_cells = value.parse().ok(),
                 _ => {}
             }
         }

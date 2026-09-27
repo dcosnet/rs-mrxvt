@@ -70,8 +70,8 @@ pub fn parse_sixel(
     parser.feed(data)?;
     let (pixels, w, h) = parser.finalize();
 
-    let cell_width = (w + cell_w_px - 1) / cell_w_px;
-    let cell_height = (h + cell_h_px - 1) / cell_h_px;
+    let cell_width = w.div_ceil(cell_w_px);
+    let cell_height = h.div_ceil(cell_h_px);
 
     Ok(InlineImage {
         pixels,
