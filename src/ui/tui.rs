@@ -45,7 +45,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use crossterm::event::{
     self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-    Event,
+    Event, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -56,7 +56,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph};
+use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 use ratatui::Terminal as RataTerminal;
 
 use alacritty_terminal::grid::Dimensions;
@@ -68,19 +68,24 @@ use alacritty_terminal::vte::ansi::{Color as AnsiColor, NamedColor};
 use crate::app::App;
 use crate::mouse::{MouseButton, MouseEventKind, MouseMods, Selection};
 use crate::terminal::manager::BroadcastTarget;
+use crate::theme::{self, Theme};
 use crate::ui::backend::BackendFactory;
-use crate::ui::event::{AppEvent, AppMouseEvent};
+use crate::ui::event::{AppEvent, AppKeyEvent, AppMouseEvent};
 use crate::ui::Renderer;
 
 pub struct TuiRenderer {
     terminal: RataTerminal<CrosstermBackend<io::Stdout>>,
+    /// Height of the tab bar in rows, from `ui.tabbar_height`. Kept on the
+    /// renderer because mouse events and `size()` need the chrome geometry
+    /// outside of the draw pass. Updated on each frame; 1 until then.
+    tabbar_height: u16,
 }
 
 impl TuiRenderer {
     pub fn new() -> Result<Self> {
         let backend = CrosstermBackend::new(stdout());
         let terminal = RataTerminal::new(backend).context("creating ratatui terminal")?;
-        Ok(Self { terminal })
+        Ok(Self { terminal, tabbar_height: 1 })
     }
 
     fn draw(&mut self, app: &mut App) -> Result<()> {
@@ -88,14 +93,24 @@ impl TuiRenderer {
         let active_idx = manager.active;
         let palette_open = app.palette.is_open();
 
+        // Resolve the configured theme once per frame. Hot-reload swaps
+        // `app.config` wholesale, so the next frame picks up a new theme.
+        let theme = theme::resolve(&app.config.ui.theme, &app.config.custom_themes)
+            .unwrap_or_else(theme::default_theme);
+
+        // Tab bar height is configurable (`ui.tabbar_height`); keep the
+        // renderer's copy in sync so mouse mapping and `size()` agree with
+        // the layout actually drawn this frame.
+        let tabbar_h = app.config.ui.tabbar_height.max(1);
+
         self.terminal.draw(|f| {
             let total = f.area();
 
-            // Top: tab bar (1 row) + terminal + status (1 row).
+            // Top: tab bar + terminal + status (1 row).
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([
-                    Constraint::Length(1),
+                    Constraint::Length(tabbar_h),
                     Constraint::Min(1),
                     Constraint::Length(1),
                 ])
@@ -121,7 +136,13 @@ impl TuiRenderer {
 
             // ---- Terminal area ----
             if let Some(tab) = manager.tabs.get(active_idx) {
-                render_terminal_grid(f, tab, chunks[1], &app.session.selection);
+                render_terminal_grid(
+                    f,
+                    tab,
+                    chunks[1],
+                    &app.session.selection,
+                    &theme,
+                );
             } else {
                 let empty = Paragraph::new("No tabs. Press Ctrl+Shift+T to create one.")
                     .alignment(Alignment::Center);
@@ -176,6 +197,7 @@ impl TuiRenderer {
                 render_palette(f, total, app);
             }
         })?;
+        self.tabbar_height = tabbar_h;
 
         Ok(())
     }
@@ -205,12 +227,20 @@ impl Renderer for TuiRenderer {
         // outer terminal. Bracketed paste means the host terminal delivers
         // its own paste (Ctrl+Shift+V / menu) as a Paste event instead of
         // synthesizing keystrokes.
+        //
+        // The keyboard-enhancement push enables the kitty keyboard protocol
+        // on terminals that support it (kitty, foot, WezTerm, ghostty, …).
+        // Without it, a legacy terminal maps Ctrl+Shift+T and Ctrl+T to the
+        // same byte and crossterm can't report the SHIFT bit, making every
+        // Ctrl+Shift+* binding unreachable. Terminals that don't know the
+        // sequence ignore it, so this degrades gracefully to legacy input.
         let mut out = stdout();
         execute!(
             out,
             EnterAlternateScreen,
             EnableMouseCapture,
             EnableBracketedPaste,
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES),
             Hide
         )
         .context("entering alt screen")?;
@@ -247,6 +277,7 @@ impl Renderer for TuiRenderer {
             LeaveAlternateScreen,
             DisableMouseCapture,
             DisableBracketedPaste,
+            PopKeyboardEnhancementFlags,
             Show
         ) {
             log::error!("failed to restore terminal: {e}");
@@ -261,15 +292,12 @@ impl Renderer for TuiRenderer {
         let deadline = Instant::now() + Duration::from_millis(timeout_ms);
         while Instant::now() < deadline {
             if event::poll(Duration::from_millis(20))? {
-                let ev = match event::read()? {
-                    Event::Key(k) => AppEvent::from(k),
-                    Event::Resize(cols, rows) => AppEvent::Resize(cols, rows),
-                    Event::FocusGained => AppEvent::FocusGained,
-                    Event::FocusLost => AppEvent::FocusLost,
-                    Event::Paste(s) => AppEvent::Paste(s),
-                    Event::Mouse(m) => AppEvent::Mouse(crossterm_mouse_to_app(m)),
-                };
-                return Ok(Some(ev));
+                let ev = event::read()?;
+                if let Some(app_ev) = self.translate_native_event(ev) {
+                    return Ok(Some(app_ev));
+                }
+                // Event dropped (chrome-area mouse click, unknown key) —
+                // keep polling until the deadline expires.
             }
         }
         Ok(None)
@@ -281,10 +309,35 @@ impl Renderer for TuiRenderer {
 
     fn size(&self) -> (u16, u16) {
         let area = self.terminal.size().unwrap_or_else(|_| Rect::new(0, 0, 80, 24).into());
-        // Subtract chrome: tab bar (1) + status (1).
+        // Subtract chrome: tab bar (`ui.tabbar_height`) + status (1).
         let cols = area.width;
-        let rows = area.height.saturating_sub(2);
+        let rows = area
+            .height
+            .saturating_sub(self.tabbar_height)
+            .saturating_sub(1);
         (cols, rows)
+    }
+}
+
+impl TuiRenderer {
+    /// Translate a native crossterm event into an [`AppEvent`].
+    ///
+    /// Returns `None` for events the app shouldn't see: unrecognised keys
+    /// (which would otherwise be typed into the shell as a bogus space) and
+    /// mouse events over the chrome (tab bar / status bar), whose screen
+    /// coordinates are shifted into grid-relative coordinates here.
+    fn translate_native_event(&self, ev: Event) -> Option<AppEvent> {
+        match ev {
+            Event::Key(k) => AppKeyEvent::try_from_crossterm(k).map(AppEvent::Key),
+            Event::Resize(cols, rows) => Some(AppEvent::Resize(cols, rows)),
+            Event::FocusGained => Some(AppEvent::FocusGained),
+            Event::FocusLost => Some(AppEvent::FocusLost),
+            Event::Paste(s) => Some(AppEvent::Paste(s)),
+            Event::Mouse(m) => {
+                let (cols, rows) = self.size();
+                crossterm_mouse_to_app(m, cols, rows, self.tabbar_height).map(AppEvent::Mouse)
+            }
+        }
     }
 }
 
@@ -306,6 +359,7 @@ fn render_terminal_grid(
     tab: &crate::terminal::TerminalTab,
     area: Rect,
     selection: &Selection,
+    theme: &Theme,
 ) {
     let grid = tab.term.grid();
 
@@ -351,15 +405,17 @@ fn render_terminal_grid(
             let point = Point { line, column: Column(col_idx) };
             let cell: &Cell = &grid[point];
 
-            let mut style = cell_to_style(cell);
+            let mut style = cell_to_style(cell, theme);
 
-            // Selection highlight: reverse video with a distinct tint.
+            // Selection highlight: a solid tinted background. The cell's own
+            // inverse flag is suppressed so the highlight stays uniform —
+            // stacking REVERSED on top of the tint renders the tint as the
+            // *text* color (the terminal swaps fg/bg at display time).
             if let Some((sel_start, sel_end)) = sel_span {
                 if col_idx >= sel_start && col_idx < sel_end {
                     style = style
-                        .add_modifier(Modifier::REVERSED)
-                        .bg(Color::Rgb(60, 71, 100))
-                        .fg(color_to_ratatui(cell.fg));
+                        .remove_modifier(Modifier::REVERSED)
+                        .bg(Color::Rgb(60, 71, 100));
                 }
             }
 
@@ -387,9 +443,9 @@ fn render_terminal_grid(
     f.render_widget(p, area);
 }
 
-fn cell_to_style(cell: &Cell) -> Style {
-    let fg = color_to_ratatui(cell.fg);
-    let bg = color_to_ratatui(cell.bg);
+fn cell_to_style(cell: &Cell, theme: &Theme) -> Style {
+    let fg = color_to_ratatui(cell.fg, theme);
+    let bg = color_to_ratatui(cell.bg, theme);
     let mut style = Style::default().fg(fg).bg(bg);
     let flags: CellFlags = cell.flags;
     if flags.contains(CellFlags::BOLD) {
@@ -410,85 +466,70 @@ fn cell_to_style(cell: &Cell) -> Style {
     style
 }
 
-fn color_to_ratatui(c: AnsiColor) -> Color {
+fn theme_rgb(c: crate::theme::Color) -> Color {
+    Color::Rgb(c.r, c.g, c.b)
+}
+
+fn color_to_ratatui(c: AnsiColor, theme: &Theme) -> Color {
     match c {
-        AnsiColor::Named(n) => named_to_ratatui(n),
+        AnsiColor::Named(n) => named_to_ratatui(n, theme),
         AnsiColor::Spec(rgb) => Color::Rgb(rgb.r, rgb.g, rgb.b),
         AnsiColor::Indexed(i) => {
-            // 16-color palette + 216-cube + 24-grayscale.
-            match i {
-                0 => Color::Black,
-                1 => Color::Red,
-                2 => Color::Green,
-                3 => Color::Yellow,
-                4 => Color::Blue,
-                5 => Color::Magenta,
-                6 => Color::Cyan,
-                7 => Color::Gray,
-                8 => Color::DarkGray,
-                9 => Color::LightRed,
-                10 => Color::LightGreen,
-                11 => Color::LightYellow,
-                12 => Color::LightBlue,
-                13 => Color::LightMagenta,
-                14 => Color::LightCyan,
-                15 => Color::White,
-                _ => {
-                    // Best-effort: 216-cube → RGB
-                    if (16..232).contains(&i) {
-                        let j = i - 16;
-                        let r = (j / 36) % 6;
-                        let g = (j / 6) % 6;
-                        let b = j % 6;
-                        let to_byte = |v: u8| if v == 0 { 0 } else { 55 + v * 40 };
-                        Color::Rgb(to_byte(r), to_byte(g), to_byte(b))
-                    } else {
-                        // grayscale ramp
-                        let v = 8 + (i - 232) * 10;
-                        Color::Rgb(v, v, v)
-                    }
-                }
+            // First 16 indices come from the theme's ANSI palette; the rest
+            // are fixed hardware palettes (216-cube + 24-grayscale).
+            if i < 16 {
+                theme_rgb(theme.ansi(i))
+            } else if (16..232).contains(&i) {
+                let j = i - 16;
+                let r = (j / 36) % 6;
+                let g = (j / 6) % 6;
+                let b = j % 6;
+                let to_byte = |v: u8| if v == 0 { 0 } else { 55 + v * 40 };
+                Color::Rgb(to_byte(r), to_byte(g), to_byte(b))
+            } else {
+                // grayscale ramp
+                let v = 8 + (i - 232) * 10;
+                Color::Rgb(v, v, v)
             }
         }
     }
 }
 
-fn named_to_ratatui(n: NamedColor) -> Color {
-    // ratatui has 16 named colors + a few extras. Map everything else to
-    // the closest semantic equivalent.
+fn named_to_ratatui(n: NamedColor, theme: &Theme) -> Color {
+    // Map alacritty's named colors onto the active theme's palette.
     match n {
-        NamedColor::Black => Color::Black,
-        NamedColor::Red => Color::Red,
-        NamedColor::Green => Color::Green,
-        NamedColor::Yellow => Color::Yellow,
-        NamedColor::Blue => Color::Blue,
-        NamedColor::Magenta => Color::Magenta,
-        NamedColor::Cyan => Color::Cyan,
-        NamedColor::White => Color::Gray,
-        NamedColor::BrightBlack => Color::DarkGray,
-        NamedColor::BrightRed => Color::LightRed,
-        NamedColor::BrightGreen => Color::LightGreen,
-        NamedColor::BrightYellow => Color::LightYellow,
-        NamedColor::BrightBlue => Color::LightBlue,
-        NamedColor::BrightMagenta => Color::LightMagenta,
-        NamedColor::BrightCyan => Color::LightCyan,
-        NamedColor::BrightWhite => Color::White,
-        NamedColor::BrightForeground => Color::White,
-        // Cursor / foreground / background variants — fall back to defaults.
-        NamedColor::Foreground => Color::Gray,
-        NamedColor::Background => Color::Black,
-        NamedColor::Cursor => Color::White,
-        // Dim* variants — ratatui has no Dim colors; map to the base color
-        // (the renderer's DIM modifier handles the actual dimming).
-        NamedColor::DimBlack => Color::Black,
-        NamedColor::DimRed => Color::Red,
-        NamedColor::DimGreen => Color::Green,
-        NamedColor::DimYellow => Color::Yellow,
-        NamedColor::DimBlue => Color::Blue,
-        NamedColor::DimMagenta => Color::Magenta,
-        NamedColor::DimCyan => Color::Cyan,
-        NamedColor::DimWhite => Color::Gray,
-        NamedColor::DimForeground => Color::Gray,
+        NamedColor::Black => theme_rgb(theme.black),
+        NamedColor::Red => theme_rgb(theme.red),
+        NamedColor::Green => theme_rgb(theme.green),
+        NamedColor::Yellow => theme_rgb(theme.yellow),
+        NamedColor::Blue => theme_rgb(theme.blue),
+        NamedColor::Magenta => theme_rgb(theme.magenta),
+        NamedColor::Cyan => theme_rgb(theme.cyan),
+        NamedColor::White => theme_rgb(theme.white),
+        NamedColor::BrightBlack => theme_rgb(theme.bright_black),
+        NamedColor::BrightRed => theme_rgb(theme.bright_red),
+        NamedColor::BrightGreen => theme_rgb(theme.bright_green),
+        NamedColor::BrightYellow => theme_rgb(theme.bright_yellow),
+        NamedColor::BrightBlue => theme_rgb(theme.bright_blue),
+        NamedColor::BrightMagenta => theme_rgb(theme.bright_magenta),
+        NamedColor::BrightCyan => theme_rgb(theme.bright_cyan),
+        NamedColor::BrightWhite => theme_rgb(theme.bright_white),
+        NamedColor::BrightForeground => theme_rgb(theme.fg),
+        // Special colors.
+        NamedColor::Foreground => theme_rgb(theme.fg),
+        NamedColor::Background => theme_rgb(theme.bg),
+        NamedColor::Cursor => theme_rgb(theme.cursor),
+        // Dim* variants — the DIM modifier handles actual dimming; the base
+        // color decides the hue.
+        NamedColor::DimBlack => theme_rgb(theme.black),
+        NamedColor::DimRed => theme_rgb(theme.red),
+        NamedColor::DimGreen => theme_rgb(theme.green),
+        NamedColor::DimYellow => theme_rgb(theme.yellow),
+        NamedColor::DimBlue => theme_rgb(theme.blue),
+        NamedColor::DimMagenta => theme_rgb(theme.magenta),
+        NamedColor::DimCyan => theme_rgb(theme.cyan),
+        NamedColor::DimWhite => theme_rgb(theme.white),
+        NamedColor::DimForeground => theme_rgb(theme.fg),
     }
 }
 
@@ -510,16 +551,31 @@ fn merge_spans(spans: Vec<Span>) -> Vec<Span> {
 
 /// Translate a crossterm mouse event into an [`AppMouseEvent`].
 ///
-/// Crossterm reports mouse positions in both pixel and cell coordinates;
-/// we use the cell coordinates (column, row) which crossterm computes
-/// from the terminal's reported cell size.
+/// Crossterm reports positions in *screen* cell coordinates, but the app
+/// works in *grid* coordinates: the terminal area starts one row below the
+/// tab bar and ends above the status bar (see the layout diagram at the top
+/// of this file). Events over the chrome yield `None` — clicking the tab
+/// bar must not start a selection in the grid, and the wheel over the
+/// status bar must not scroll it.
 ///
 /// Button releases keep their button identity (crossterm's `Up(b)` carries
 /// the button) so local selection logic can distinguish left-release from
 /// other releases; the mouse encoders ignore it (release is signaled by
 /// the event kind).
-fn crossterm_mouse_to_app(m: crossterm::event::MouseEvent) -> AppMouseEvent {
+fn crossterm_mouse_to_app(
+    m: crossterm::event::MouseEvent,
+    grid_cols: u16,
+    grid_rows: u16,
+    tabbar_height: u16,
+) -> Option<AppMouseEvent> {
     use crossterm::event::{MouseButton as CButton, MouseEventKind as CKind};
+
+    // Screen rows above the grid are the tab bar; row `tabbar_height +
+    // grid_rows` and beyond are the status bar or outside the window. Grid
+    // rows are screen rows tabbar_height..=tabbar_height + grid_rows - 1.
+    if m.row < tabbar_height || m.row >= tabbar_height.saturating_add(grid_rows) {
+        return None;
+    }
 
     let map_button = |b: &CButton| match b {
         CButton::Left => MouseButton::Left,
@@ -543,17 +599,18 @@ fn crossterm_mouse_to_app(m: crossterm::event::MouseEvent) -> AppMouseEvent {
         | CKind::ScrollLeft | CKind::ScrollRight => MouseEventKind::Press,
     };
 
-    AppMouseEvent {
+    Some(AppMouseEvent {
         button,
-        col: m.column as u32,
-        row: m.row as u32,
+        // Clamp the column to the grid; rows are already validated above.
+        col: (m.column.min(grid_cols.saturating_sub(1))) as u32,
+        row: (m.row - tabbar_height) as u32,
         mods: MouseMods {
             shift: m.modifiers.contains(crossterm::event::KeyModifiers::SHIFT),
             ctrl: m.modifiers.contains(crossterm::event::KeyModifiers::CONTROL),
             alt: m.modifiers.contains(crossterm::event::KeyModifiers::ALT),
         },
         kind,
-    }
+    })
 }
 
 fn render_palette(f: &mut ratatui::Frame<'_>, total: Rect, app: &App) {
@@ -584,25 +641,22 @@ fn render_palette(f: &mut ratatui::Frame<'_>, total: Rect, app: &App) {
         .style(Style::default().fg(Color::Yellow));
     f.render_widget(query_line, chunks[0]);
 
-    // Results.
+    // Results. Rendered statefully so ratatui applies `highlight_style` to
+    // the selected row (a plain `render_widget` never applies it).
     let items: Vec<ListItem> = app
         .palette
         .entries
         .iter()
-        .enumerate()
-        .map(|(i, e)| {
-            let style = if i == app.palette.selected {
-                Style::default().bg(Color::DarkGray).fg(Color::White).add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(Color::Gray)
-            };
-            ListItem::new(format!("[{}] {}", e.category, e.name)).style(style)
-        })
+        .map(|e| ListItem::new(format!("[{}] {}", e.category, e.name)).style(Style::default().fg(Color::Gray)))
         .collect();
 
+    let mut list_state = ListState::default();
+    if !app.palette.entries.is_empty() {
+        list_state.select(Some(app.palette.selected.min(app.palette.entries.len() - 1)));
+    }
     let list = List::new(items)
-        .highlight_style(Style::default().bg(Color::Cyan).fg(Color::Black));
-    f.render_widget(list, chunks[1]);
+        .highlight_style(Style::default().bg(Color::DarkGray).fg(Color::White).add_modifier(Modifier::BOLD));
+    f.render_stateful_widget(list, chunks[1], &mut list_state);
 }
 
 /// Flush pending bytes from the OS-level stdin buffer.
@@ -657,3 +711,68 @@ fn drain_stale_input() {
     }
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::{MouseButton as CButton, MouseEventKind as CKind};
+
+    fn mouse_ev(row: u16, col: u16, kind: CKind) -> crossterm::event::MouseEvent {
+        crossterm::event::MouseEvent {
+            kind,
+            column: col,
+            row,
+            modifiers: crossterm::event::KeyModifiers::empty(),
+        }
+    }
+
+    #[test]
+    fn mouse_rows_are_offset_by_tab_bar() {
+        // Grid starts at screen row 1 (tab bar height 1): screen row 2 → row 1.
+        let ev = crossterm_mouse_to_app(
+            mouse_ev(2, 5, CKind::Down(CButton::Left)),
+            80,
+            10,
+            1,
+        )
+        .unwrap();
+        assert_eq!(ev.row, 1);
+        assert_eq!(ev.col, 5);
+    }
+
+    #[test]
+    fn mouse_events_on_chrome_are_dropped() {
+        // Tab bar (row 0 with height 1).
+        assert!(crossterm_mouse_to_app(mouse_ev(0, 3, CKind::Down(CButton::Left)), 80, 10, 1).is_none());
+        // Status bar: grid occupies rows 1..=10, so row 11 is chrome.
+        assert!(crossterm_mouse_to_app(mouse_ev(11, 3, CKind::Down(CButton::Left)), 80, 10, 1).is_none());
+        // Same with a taller tab bar: grid rows 2..=11, row 12 is chrome.
+        assert!(crossterm_mouse_to_app(mouse_ev(12, 3, CKind::Down(CButton::Left)), 80, 10, 2).is_none());
+    }
+
+    #[test]
+    fn mouse_wheel_inside_grid_maps_to_grid_row() {
+        let ev = crossterm_mouse_to_app(
+            mouse_ev(4, 0, CKind::ScrollUp),
+            80,
+            10,
+            1,
+        )
+        .unwrap();
+        assert_eq!(ev.button, MouseButton::WheelUp);
+        assert_eq!(ev.row, 3);
+    }
+
+    #[test]
+    fn mouse_columns_are_clamped_to_grid() {
+        // A click past the last column (transient resize race) clamps.
+        let ev = crossterm_mouse_to_app(
+            mouse_ev(1, 200, CKind::Down(CButton::Left)),
+            80,
+            10,
+            1,
+        )
+        .unwrap();
+        assert_eq!(ev.col, 79);
+    }
+}

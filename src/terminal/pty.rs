@@ -76,12 +76,31 @@ impl PtySession {
             .context("opening pty")?;
 
         let cmd = build_command(profile, fallback_shell)?;
-        let child = pair
+        let mut child = pair
             .slave
             .spawn_command(cmd)
             .context("spawning child process")?;
 
         let pid = child.process_id().unwrap_or(0) as u32;
+
+        // Reap the child so exited shells don't linger as zombies until the
+        // whole emulator exits. The reaper thread blocks in `wait()` until
+        // the child is gone (when the user types `exit`, the master closes
+        // and the kernel SIGHUPs the child); nothing else touches the handle.
+        let pid_for_log = pid;
+        std::thread::Builder::new()
+            .name(format!("mrxvt-reap-{pid_for_log}"))
+            .spawn(move || {
+                match child.wait() {
+                    Ok(status) => {
+                        log::debug!("child {pid_for_log} exited: {status}");
+                    }
+                    Err(e) => {
+                        log::debug!("waiting on child {pid_for_log} failed: {e}");
+                    }
+                }
+            })
+            .ok();
 
         // Take a reader BEFORE dropping the slave so the kernel keeps the
         // master side alive.

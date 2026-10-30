@@ -94,8 +94,10 @@ impl TerminalManager {
         Ok(id)
     }
 
-    /// Close the tab at `index`. Switches active to the previous tab if needed.
-    /// Returns `true` if a tab was closed.
+    /// Close the tab at `index`. Keeps the active index pointing at the same
+    /// logical tab when possible (a tab closed *before* the active one
+    /// shifts the vec, so the active index must follow it), then clamps to
+    /// bounds. Returns `true` if a tab was closed.
     pub fn close_tab(&mut self, index: usize) -> bool {
         if index >= self.tabs.len() {
             return false;
@@ -103,8 +105,15 @@ impl TerminalManager {
         self.tabs.remove(index);
         if self.tabs.is_empty() {
             self.active = 0;
-        } else if self.active >= self.tabs.len() {
-            self.active = self.tabs.len() - 1;
+        } else {
+            if index < self.active {
+                // The active tab shifted one slot toward the front; follow it
+                // so focus doesn't jump to a different tab.
+                self.active -= 1;
+            }
+            if self.active >= self.tabs.len() {
+                self.active = self.tabs.len() - 1;
+            }
         }
         true
     }
@@ -291,18 +300,21 @@ impl TerminalManager {
 
     /// Drain all PTYs. Should be called once per event-loop tick.
     ///
-    /// Returns a tuple of (active_tab_received_data, any_tab_eof).
+    /// Returns a tuple of (active_tab_received_data, any_tab_eof). `Ok(0)`
+    /// from `poll_pty` just means the tab was idle this tick — EOF is only
+    /// reported once the reader thread delivered the sentinel and the tab's
+    /// `eof_seen` flag is actually set.
     pub fn poll_all(&mut self) -> (bool, bool) {
         let mut active_got_data = false;
         let mut any_eof = false;
         for (i, tab) in self.tabs.iter_mut().enumerate() {
             match tab.poll_pty() {
-                Ok(0) => {
-                    any_eof = true;
-                }
-                Ok(_) => {
-                    if i == self.active {
+                Ok(n) => {
+                    if n > 0 && i == self.active {
                         active_got_data = true;
+                    }
+                    if tab.eof_seen {
+                        any_eof = true;
                     }
                 }
                 Err(e) => {
@@ -333,6 +345,12 @@ impl TerminalManager {
                 let p = config.profile(&self.default_profile);
                 if let Err(e) = self.open_tab(&p, None, cols, rows) {
                     log::error!("NewTab failed: {e}");
+                } else {
+                    // A tab opened from a keybinding/palette gains focus
+                    // (classic mrxvt behavior). Startup tabs opened via
+                    // `App::new` don't go through this path, so the initial
+                    // view stays on tab 1.
+                    self.active = self.tabs.len() - 1;
                 }
                 Action::Continue
             }
@@ -340,6 +358,8 @@ impl TerminalManager {
                 let p = config.profile(name);
                 if let Err(e) = self.open_tab(&p, None, cols, rows) {
                     log::error!("NewTabProfile failed: {e}");
+                } else {
+                    self.active = self.tabs.len() - 1;
                 }
                 Action::Continue
             }
@@ -376,8 +396,16 @@ impl TerminalManager {
             }
             Command::ResetTerminal => {
                 if let Some(t) = self.active_tab_mut() {
-                    if let Err(e) = t.write_input(b"\x1bc") {
-                        log::warn!("RIS (reset) failed: {e}");
+                    // Reset the LOCAL emulator state (modes, colors, charset,
+                    // scroll-region state, alt screen) — the same thing
+                    // xterm does for its `reset` menu entry. Writing RIS to
+                    // the PTY would only dump a stray ESC-c into the child's
+                    // stdin, leaving our parser wedged in whatever mode the
+                    // misbehaving program left behind.
+                    t.reset_state();
+                    t.scroll_display(Scroll::Bottom);
+                    if t.title != t.default_title {
+                        t.title = t.default_title.clone();
                     }
                 }
                 Action::Continue
@@ -588,6 +616,31 @@ mod tests {
         let mut m = fresh_manager();
         let cfg = Config::default();
         assert_eq!(m.execute(&Command::Quit, 40, 10, &cfg), Action::Quit);
+    }
+
+    #[test]
+    fn close_tab_before_active_keeps_focus_on_same_tab() {
+        let mut m = fresh_manager(); // tabs t1, t2
+        let p = test_profile("sleep 5");
+        let _ = m.open_tab(&p, Some("t3".into()), 40, 10);
+        m.active = 1; // user is on t2 (index 1)
+
+        // Closing tab 0 (before the active one) must NOT shift focus.
+        m.close_tab(0);
+        assert_eq!(m.tabs.len(), 2);
+        assert_eq!(m.active, 0, "active index must follow the same logical tab");
+        assert_eq!(m.tabs[0].title, "t2");
+    }
+
+    #[test]
+    fn new_tab_command_focuses_the_new_tab() {
+        let mut m = fresh_manager();
+        let cfg = Config::default();
+        m.execute(&Command::NewTab, 40, 10, &cfg);
+        assert_eq!(m.tabs.len(), 3);
+        assert_eq!(m.active, 2, "a tab opened by command should gain focus");
+        m.execute(&Command::NewTabProfile("zsh".into()), 40, 10, &cfg);
+        assert_eq!(m.active, 3);
     }
 
     // ─── close_dead_tabs tests ───────────────────────────────────────────

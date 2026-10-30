@@ -281,6 +281,25 @@ impl KeyBindingTable {
         }
     }
 
+    /// Apply the config `[macros]` table on top of the current bindings.
+    ///
+    /// Each entry maps a chord string to a command spec (see
+    /// [`Command::parse_spec`]); later entries override earlier ones and
+    /// defaults. Malformed entries are logged and skipped.
+    pub fn apply_macros(&mut self, macros: &std::collections::HashMap<String, String>) {
+        for (chord_str, spec) in macros {
+            let Some(chord) = parse_chord(chord_str) else {
+                log::warn!("ignoring macro with unparseable chord {chord_str:?}");
+                continue;
+            };
+            let Some(cmd) = Command::parse_spec(spec) else {
+                log::warn!("ignoring macro {chord_str:?}: unknown command spec {spec:?}");
+                continue;
+            };
+            self.map.insert(chord, cmd);
+        }
+    }
+
     /// Resolve a crossterm key event to a command, if any.
     pub fn resolve(&self, ev: KeyEvent) -> Option<Command> {
         let chord = KeyChord::from_crossterm(ev)?;
@@ -456,5 +475,64 @@ mod tests {
         assert_eq!(t.resolve(ev), Some(Command::ScrollToTop));
         let ev = KeyEvent::new(KeyCode::End, KeyModifiers::SHIFT);
         assert_eq!(t.resolve(ev), Some(Command::ScrollToBottom));
+    }
+
+    #[test]
+    fn macros_add_and_override_bindings() {
+        use std::collections::HashMap;
+        let mut macros = HashMap::new();
+        macros.insert("Ctrl+Shift+R".to_string(), "ResetTerminal".to_string());
+        macros.insert("Ctrl+Shift+G".to_string(), "ToggleBroadcastGroup:web".to_string());
+        macros.insert("Alt+9".to_string(), "TagActiveTab:cluster".to_string());
+        // Override a default.
+        macros.insert("Ctrl+Shift+T".to_string(), "Quit".to_string());
+
+        let mut t = KeyBindingTable::defaults();
+        t.apply_macros(&macros);
+
+        let ev = KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL | KeyModifiers::SHIFT);
+        assert_eq!(t.resolve(ev), Some(Command::ResetTerminal));
+        let ev = KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL | KeyModifiers::SHIFT);
+        assert_eq!(
+            t.resolve(ev),
+            Some(Command::ToggleBroadcastGroup("web".into()))
+        );
+        let ev = KeyEvent::new(KeyCode::Char('9'), KeyModifiers::ALT);
+        assert_eq!(t.resolve(ev), Some(Command::TagActiveTab("cluster".into())));
+        let ev = KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL | KeyModifiers::SHIFT);
+        assert_eq!(t.resolve(ev), Some(Command::Quit));
+    }
+
+    #[test]
+    fn macros_with_garbage_are_skipped() {
+        use std::collections::HashMap;
+        let mut macros = HashMap::new();
+        macros.insert("Not+A+Chord".to_string(), "Quit".to_string());
+        macros.insert("Ctrl+Shift+R".to_string(), "NoSuchCommand".to_string());
+        macros.insert("Ctrl+Shift+T".to_string(), "GotoTab:notanumber".to_string());
+        macros.insert("Ctrl+Shift+Y".to_string(), "TagActiveTab".to_string()); // missing arg
+
+        let mut t = KeyBindingTable::defaults();
+        t.apply_macros(&macros);
+        let ev = KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL | KeyModifiers::SHIFT);
+        assert_eq!(t.resolve(ev), None);
+        let ev = KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL | KeyModifiers::SHIFT);
+        assert_eq!(t.resolve(ev), Some(Command::NewTab), "garbage macros must not clobber defaults");
+    }
+
+    #[test]
+    fn parse_spec_handles_parameterized_forms() {
+        assert_eq!(
+            Command::parse_spec("NewTabProfile:zsh"),
+            Some(Command::NewTabProfile("zsh".into()))
+        );
+        assert_eq!(
+            Command::parse_spec("GotoTab:3"),
+            Some(Command::GotoTab(3))
+        );
+        assert_eq!(Command::parse_spec("Quit"), Some(Command::Quit));
+        assert_eq!(Command::parse_spec("Quit:"), None, "Quit takes no arg");
+        assert_eq!(Command::parse_spec("TagActiveTab"), None, "missing arg");
+        assert_eq!(Command::parse_spec("  ResetTerminal  "), Some(Command::ResetTerminal));
     }
 }

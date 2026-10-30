@@ -64,8 +64,7 @@ Three opt-in feature flags extend the terminal in orthogonal directions:
   `-b {auto,tui,wgpu,soft}` (backend).
 - **TOML config** — `~/.config/rs-mrxvt/config.toml` with profiles, macros,
   keybindings, and transparency settings.
-- **Per-tab fading** — inactive tabs dim smoothly via a lerp animation.
-- **Stress-tested** — 200+ unit + integration tests, plus a 50-instance
+- **Stress-tested** — 280+ unit + integration tests, plus a 50-instance
   Python stress harness that broadcasts a marker to 50 shells in ~30ms.
 
 ### With `--features lua`
@@ -77,52 +76,61 @@ Three opt-in feature flags extend the terminal in orthogonal directions:
 ### With `--features gpu`
 - **wgpu renderer** — Vulkan/GL accelerated. Instanced quad pipeline with
   a glyph atlas texture and WGSL shaders. Renders the full terminal grid
-  (text + colors + tab bar + status bar).
+  (text + colors + cursor + selection highlight + tab bar + status bar),
+  with mouse input (selection, SGR reporting, wheel) like the TUI backend.
 - **softbuffer renderer** — CPU rasterizer via tiny-skia + ab_glyph. The
   modern VESA mode: works on any display server, no GPU driver required.
-- **Pseudo-transparency + tinting** — classic mrxvt `-tint` and `-sh` flags,
-  implemented as a WGSL shader uniform. Configurable via `[transparency]`
-  in config.
+  Same grid/cursor/selection/mouse feature set as wgpu.
+- **Themed rendering** — both GUI renderers resolve `ui.theme` /
+  `[custom_themes]` per frame, matching the TUI colors.
 - **Shared glyph cache** — `ab_glyph` rasterizes glyphs on demand; both
   backends use the same cache.
+- **Pseudo-transparency + per-tab fading** (planned) — `[transparency]`
+  config and the fade model already parse; the renderer-side shader/
+  compositing wiring is the next step.
 
 ### With `--features images`
-- **iTerm2 inline images** — `ESC ] 1337 ; File = ...` protocol. Display
-  PNG/JPEG/GIF/WebP/BMP inline. Compatible with `ranger`, `neofetch`,
-  `chafa`, `viu`.
-- **Thread-safe image store** — images keyed by ID, mutex-protected for
-  concurrent PTY reader + renderer access.
+- **iTerm2 inline image decoder** — `ESC ] 1337 ; File = ...` payloads
+  decode to RGBA (PNG/JPEG/GIF/WebP/BMP), normalized through
+  `DynamicImage::to_rgba8` so every native layout decodes correctly.
+- **Sixel parser** — pure-Rust state machine with color registers and
+  repeat runs, tested against stride/regression cases.
+- **Status** — parsers and the thread-safe image store are in place and
+  tested; the PTY hooks that feed them and the renderer compositing that
+  draws them are the remaining work.
 
 ## 🗺️ Roadmap
 
 | Feature                | Status      | Notes                                          |
 |------------------------|-------------|------------------------------------------------|
-| Multi-tab PTY          | ✅ shipped  | 200+ tests covering routing, broadcasting, EOF |
+| Multi-tab PTY          | ✅ shipped  | 280+ tests covering routing, broadcasting, EOF |
 | Input broadcasting     | ✅ shipped  | Active / All / Group(tag)                      |
 | Command palette        | ✅ shipped  | fuzzy-matcher, Ctrl+Shift+P                    |
 | Backend auto-detect    | ✅ shipped  | wgpu → soft → tui chain                        |
 | TUI renderer           | ✅ shipped  | ratatui + crossterm, distro-agnostic           |
 | wgpu renderer          | ✅ shipped  | instanced pipeline, glyph atlas, WGSL shaders  |
 | softbuffer renderer    | ✅ shipped  | tiny-skia + ab_glyph, the VESA mode            |
-| Pseudo-transparency    | ✅ shipped  | WGSL shader, tint + opacity uniforms           |
-| Per-tab fading         | ✅ shipped  | lerp animation, configurable speed/amount      |
+| GUI backend input      | ✅ shipped  | Mouse (selection/SGR reporting/wheel), cursor + selection highlight, themes in wgpu+soft |
+| Pseudo-transparency    | 🚧 planned  | Config parsed + modeled; GPU shader wiring next |
+| Per-tab fading         | 🚧 planned  | fade.rs modeled; renderer wiring next          |
 | Lua config             | ✅ shipped  | mlua, dynamic themes, programmable macros      |
-| Config hot-reload      | ✅ shipped  | Polling watcher, survives bad configs          |
-| iTerm2 image protocol  | ✅ shipped  | PNG/JPEG/GIF/WebP/BMP inline                   |
-| Sixel image protocol   | ✅ shipped  | Pure-Rust parser, color registers, repeats     |
-| Mouse + SGR-1006       | ✅ shipped  | X10/X11/SGR encoders, shift-bypass selection   |
-| OSC 8 hyperlinks       | ✅ shipped  | Parser + scanner + cell-indexed store          |
+| Config hot-reload      | ✅ shipped  | Polling watcher wired into the main loop       |
+| iTerm2 image protocol  | 🚧 parser   | Decoder ready (tested); PTY hook + compositing next |
+| Sixel image protocol   | 🚧 parser   | Pure-Rust parser (tested); PTY hook + drawing next |
+| Mouse + SGR-1006       | ✅ shipped  | X10/X11/SGR encoders, motion bit, shift-bypass |
+| OSC 8 hyperlinks       | 🚧 parser   | Parser + store; underline rendering next       |
 | Alt+N / Alt+Arrows     | ✅ shipped  | New tab, shuffle forward/back                  |
 | Alt+Shift+X close      | ✅ shipped  | Closes focused tab                             |
 | Alt+Z zsh tab          | ✅ shipped  | Secondary shell on a hotkey                    |
-| True-color themes      | ✅ shipped  | Tokyo Night, Gruvbox, Dracula, Solarized       |
+| True-color themes      | ✅ shipped  | Tokyo Night, Gruvbox, Dracula, Solarized — applied in all three renderers |
+| Custom themes          | ✅ shipped  | `[custom_themes.<name>]` tables in config.toml |
+| Config macros          | ✅ shipped  | `[macros]` chord → command bindings            |
 | Multi-distro sysprep   | ✅ shipped  | pacman/apt/dnf/zypper/xbps/apk/cast/emerge     |
 | Clipboard              | ✅ shipped  | Select/copy/paste, OSC 52 mirror, tools+mock   |
 | Scrollback navigation  | ✅ shipped  | Wheel, Shift+PgUp/PgDn/Home/End, palette cmds  |
 | Selection modes        | ✅ shipped  | Drag/word/line, copy-on-select, highlight      |
 | Tab title sync         | ✅ shipped  | OSC 0/2 from child renames the tab             |
 | Login shells           | ✅ shipped  | GUI-session env reaches apps (mrxvt default)   |
-| GUI backend polish     | 🚧 planned  | Selection/cursor highlight in wgpu+soft UIs    |
 
 ## 🚀 Quick start
 
@@ -194,7 +202,15 @@ selection, right-click pastes the clipboard, and the wheel scrolls the
 scrollback (or the alternate-screen program). `Shift+click` bypasses
 application mouse reporting so you can always select text.
 
-All bindings are rebindable in `config.toml` or `config.lua`.
+All bindings are rebindable in `config.toml` (`[macros]` maps a chord
+string to a command spec, e.g. `"Ctrl+Shift+R" = "ResetTerminal"` or
+`"Ctrl+Shift+G" = "ToggleBroadcastGroup:web"`) or `config.lua`.
+
+> **Host-terminal note:** the `Ctrl+Shift+*` chords rely on the kitty
+> keyboard protocol, which rs-mrxvt enables at startup. On supporting
+> hosts (kitty, foot, WezTerm, ghostty, recent alacritty) they work as
+> documented; legacy terminals map Ctrl+Shift+T and Ctrl+T to the same
+> byte, so on those hosts prefer the `Alt+` bindings.
 
 ## ⚙️ Configuration
 
@@ -212,6 +228,10 @@ tint = "#004080"      # blue tint
 opacity = 0.85         # 1.0 = opaque, 0.0 = fully transparent
 # background_image = "/path/to/wallpaper.png"
 ```
+
+> **Note:** the `[transparency]` schema parses today but no renderer
+> consumes it yet (see the roadmap) — settings have no visual effect
+> until the shader wiring lands.
 
 ### Clipboard
 
@@ -264,8 +284,23 @@ Built-in true-color themes (set `ui.theme` in your config):
 | `solarized-dark`  | Solarized Dark                  |
 | `solarized-light` | Solarized Light                 |
 
-Custom themes can be defined in TOML — see `examples/config.toml` for the
-full color list (16 ANSI colors + bg/fg/cursor).
+Custom themes are `[custom_themes.<name>]` tables in config.toml with the
+full palette (16 ANSI colors + bg/fg/cursor, `#RRGGBB` values):
+
+```toml
+[ui]
+theme = "midnight"
+
+[custom_themes.midnight]
+bg = "#0a0e14"
+fg = "#c5cdd7"
+cursor = "#c5cdd7"
+# ... black, red, green, yellow, blue, magenta, cyan, white and the
+# bright_* variants — see examples/config.toml for the complete list.
+```
+
+Themes apply in every renderer (TUI, wgpu, softbuffer), and with config
+hot-reload a theme edit takes effect on the next frame.
 
 ## 🛠 Troubleshooting
 

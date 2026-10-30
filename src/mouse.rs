@@ -131,16 +131,18 @@ pub enum MouseEventKind {
 /// - Press:   `ESC [ < button ; col ; row M`
 /// - Release: `ESC [ < button ; col ; row m`
 ///
-/// Where `button` is the button code + modifier bits (lower 3 bits = button,
-/// bit 2 = shift, bit 3 = meta, bit 4 = ctrl, bit 5 = wheel, bit 6 = motion
-/// flag — actually for SGR we just encode button+mods, motion is a separate
-/// M vs m signal).
+/// Where `button` is the button code + modifier bits (lower 2 bits = button,
+/// bit 2 = shift, bit 3 = meta, bit 4 = ctrl, bit 5 (32) = motion flag,
+/// bit 6 (64) = wheel buttons). `M`/`m` signal press/motion vs release —
+/// motion itself is flagged by OR-ing 32 into the button code, exactly like
+/// the legacy X11 encoding, so programs can tell `<0;…M` (press) from
+/// `<32;…M` (drag) from `<35;…M` (hover motion).
 pub fn encode_sgr(ev: MouseEvent, mode: MouseMode) -> Option<Vec<u8>> {
     if !mode.sgr {
         // SGR encoding was not negotiated; fall back to legacy elsewhere.
         return None;
     }
-    let code = button_code(ev.button, ev.mods);
+    let mut code = button_code(ev.button, ev.mods);
     let suffix = match ev.kind {
         MouseEventKind::Press => {
             if !mode.reports_press() {
@@ -158,9 +160,7 @@ pub fn encode_sgr(ev: MouseEvent, mode: MouseMode) -> Option<Vec<u8>> {
             if !mode.reports_motion(ev.button != MouseButton::None) {
                 return None;
             }
-            // SGR-1006 uses M for motion-with-button, m for motion-without.
-            // Convention: motion events always use M; the button field
-            // encodes which button (or 35 = no button) is held.
+            code |= 32;
             'M'
         }
     };
@@ -178,7 +178,7 @@ pub fn encode_sgr(ev: MouseEvent, mode: MouseMode) -> Option<Vec<u8>> {
 ///
 /// Legacy format: `ESC [ M <button-byte> <col-byte> <row-byte>`
 /// where each byte is the value + 32 (to keep it in the printable range).
-/// Coordinates are clamped to 1..227 (bytes 33..255).
+/// Coordinates are clamped to 1..223 (bytes 33..255).
 pub fn encode_x11(ev: MouseEvent, mode: MouseMode) -> Option<Vec<u8>> {
     let _should = match ev.kind {
         MouseEventKind::Press => mode.reports_press(),
@@ -476,6 +476,29 @@ mod tests {
         };
         let mode = MouseMode::default();
         assert!(encode_sgr(ev, mode).is_none());
+    }
+
+    #[test]
+    fn sgr_motion_sets_motion_bit() {
+        let mode = MouseMode { x11: true, motion: true, sgr: true, ..Default::default() };
+        // Drag motion with the left button held: 0 | 32 = 32.
+        let drag = MouseEvent {
+            button: MouseButton::Left,
+            col: 4, row: 5,
+            mods: MouseMods::default(),
+            kind: MouseEventKind::Motion,
+        };
+        let s = String::from_utf8(encode_sgr(drag, mode).unwrap()).unwrap();
+        assert_eq!(s, "\x1b[<32;5;6M");
+        // Hover motion (no button): 3 | 32 = 35.
+        let hover = MouseEvent {
+            button: MouseButton::None,
+            col: 4, row: 5,
+            mods: MouseMods::default(),
+            kind: MouseEventKind::Motion,
+        };
+        let s = String::from_utf8(encode_sgr(hover, mode).unwrap()).unwrap();
+        assert_eq!(s, "\x1b[<35;5;6M");
     }
 
     #[test]

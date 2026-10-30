@@ -54,6 +54,11 @@ pub struct Config {
     /// Example: `"Ctrl+Shift+R" = "ResetTerminal"`
     #[serde(default)]
     pub macros: HashMap<String, String>,
+    /// User-defined themes: `[custom_themes.<name>]` tables with the full
+    /// palette (16 ANSI colors + bg/fg/cursor). `ui.theme` references them
+    /// by name; a custom theme overrides a built-in of the same name.
+    #[serde(default)]
+    pub custom_themes: HashMap<String, crate::theme::Theme>,
     /// Pseudo-transparency + tinting configuration.
     ///
     /// Only effective when built with `--features gpu` and using a GUI
@@ -187,6 +192,7 @@ impl Default for Config {
             profiles: HashMap::new(),
             default_profile: default_profile(),
             macros: HashMap::new(),
+            custom_themes: HashMap::new(),
             transparency: TransparencyConfig::default(),
             clipboard: ClipboardConfig::default(),
             gpu: GpuConfig::default(),
@@ -231,7 +237,7 @@ impl Default for UiConfig {
 
 fn default_focus() -> String { "click".into() }
 fn default_true() -> bool { true }
-fn default_tabbar_height() -> u16 { 1 }
+pub(crate) fn default_tabbar_height() -> u16 { 1 }
 fn default_theme() -> String { "mrxvt".into() }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -264,7 +270,7 @@ impl Default for TerminalConfig {
 fn default_cols() -> u16 { 80 }
 fn default_rows() -> u16 { 24 }
 fn default_scrollback() -> usize { 10_000 }
-fn default_shell() -> String {
+pub(crate) fn default_shell() -> String {
     // Prefer bash explicitly — it's the most common default shell across
     // distros. Fall back to $SHELL, then /bin/sh.
     if let Some(candidate) = ["/bin/bash", "/usr/bin/bash"]
@@ -444,6 +450,39 @@ command = ["bash"]
 "#;
         let cfg: Config = toml::from_str(toml).unwrap();
         assert_eq!(cfg.macros.get("Ctrl+Shift+R").unwrap(), "ResetTerminal");
+    }
+
+    #[test]
+    fn custom_themes_parse_and_resolve() {
+        let toml = r##"
+[ui]
+theme = "midnight"
+
+[custom_themes.midnight]
+bg = "#0a0e14"
+fg = "#c5cdd7"
+cursor = "#c5cdd7"
+black = "#0a0e14"
+red = "#f07178"
+green = "#86b300"
+yellow = "#f2ae49"
+blue = "#399ee6"
+magenta = "#a37acc"
+cyan = "#4cbf99"
+white = "#c5cdd7"
+bright_black = "#565b66"
+bright_red = "#f07178"
+bright_green = "#86b300"
+bright_yellow = "#f2ae49"
+bright_blue = "#399ee6"
+bright_magenta = "#a37acc"
+bright_cyan = "#4cbf99"
+bright_white = "#ffffff"
+"##;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        let resolved = crate::theme::resolve(&cfg.ui.theme, &cfg.custom_themes);
+        assert!(resolved.is_some(), "custom theme must resolve");
+        assert_eq!(resolved.unwrap().bg.to_hex(), "#0A0E14");
     }
 
     #[test]

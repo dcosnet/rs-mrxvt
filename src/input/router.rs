@@ -35,7 +35,7 @@ use crate::terminal::manager::{Action, BroadcastTarget, TerminalManager};
 use crate::config::Config;
 
 /// What should the app do after handling this input?
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InputAction {
     /// Keep running; redraw.
     Continue,
@@ -45,6 +45,10 @@ pub enum InputAction {
     OpenPalette,
     /// Input was a command (palette etc.); the manager doesn't need raw bytes.
     Handled,
+    /// A resolved binding the router cannot execute itself (clipboard
+    /// commands need the App's clipboard backend and session selection).
+    /// The App must run it via `App::run_command`.
+    Command(Command),
 }
 
 pub struct InputRouter {
@@ -70,6 +74,11 @@ impl InputRouter {
             match &cmd {
                 Command::OpenPalette => return InputAction::OpenPalette,
                 Command::Quit => return InputAction::Quit,
+                // Clipboard commands need the App layer (clipboard backend +
+                // session selection); hand them up instead of dropping them.
+                Command::CopySelection | Command::PasteClipboard | Command::PastePrimary => {
+                    return InputAction::Command(cmd.clone())
+                }
                 other => {
                     let action = manager.execute(other, cols, rows, config);
                     if action == Action::Quit {
@@ -82,8 +91,10 @@ impl InputRouter {
 
         // 2. Translate to bytes and route to PTY(s).
         if let Some(bytes) = key_to_bytes(ev) {
-            if let Err(e) = manager.route_input(&bytes) {
-                log::debug!("route_input failed: {e}");
+            if !bytes.is_empty() {
+                if let Err(e) = manager.route_input(&bytes) {
+                    log::debug!("route_input failed: {e}");
+                }
             }
         }
         InputAction::Continue
@@ -123,53 +134,88 @@ pub fn key_to_bytes(ev: KeyEvent) -> Option<Vec<u8>> {
                 s.into_bytes()
             }
         }
-        KeyCode::Enter => b"\r".to_vec(),
-        KeyCode::Tab => b"\t".to_vec(),
+        KeyCode::Enter => {
+            if alt { b"\x1b\r".to_vec() } else { b"\r".to_vec() }
+        }
+        KeyCode::Tab => {
+            if alt { b"\x1b\t".to_vec() } else { b"\t".to_vec() }
+        }
         KeyCode::BackTab => b"\x1b[Z".to_vec(),
         KeyCode::Backspace => {
             // DEL (^?) — matches what xterm sends with default config.
             if alt { b"\x1b\x7f".to_vec() } else { b"\x7f".to_vec() }
         }
-        KeyCode::Esc => b"\x1b".to_vec(),
-        KeyCode::Left  => csi_arrow("D", ctrl, shift),
-        KeyCode::Right => csi_arrow("C", ctrl, shift),
-        KeyCode::Up    => csi_arrow("A", ctrl, shift),
-        KeyCode::Down  => csi_arrow("B", ctrl, shift),
-        KeyCode::Home => {
-            let seq = if ctrl { "\x1b[1;5H" } else { "\x1b[H" };
-            seq.as_bytes().to_vec()
+        KeyCode::Esc => {
+            // Alt+Esc = ESC ESC (the standard meta prefix applied to Esc).
+            if alt { b"\x1b\x1b".to_vec() } else { b"\x1b".to_vec() }
         }
-        KeyCode::End => {
-            let seq = if ctrl { "\x1b[1;5F" } else { "\x1b[F" };
-            seq.as_bytes().to_vec()
-        }
-        KeyCode::PageUp => b"\x1b[5~".to_vec(),
-        KeyCode::PageDown => b"\x1b[6~".to_vec(),
-        KeyCode::Delete => b"\x1b[3~".to_vec(),
-        KeyCode::Insert => b"\x1b[2~".to_vec(),
+        KeyCode::Left  => csi_arrow("D", ctrl, shift, alt),
+        KeyCode::Right => csi_arrow("C", ctrl, shift, alt),
+        KeyCode::Up    => csi_arrow("A", ctrl, shift, alt),
+        KeyCode::Down  => csi_arrow("B", ctrl, shift, alt),
+        KeyCode::Home => mod_aware_csi("H", ctrl, shift, alt),
+        KeyCode::End => mod_aware_csi("F", ctrl, shift, alt),
+        KeyCode::PageUp => mod_aware_tilde(5, ctrl, shift, alt),
+        KeyCode::PageDown => mod_aware_tilde(6, ctrl, shift, alt),
+        KeyCode::Delete => mod_aware_tilde(3, ctrl, shift, alt),
+        KeyCode::Insert => mod_aware_tilde(2, ctrl, shift, alt),
         KeyCode::F(n) => f_key_seq(n),
         _ => return None,
     };
     Some(bytes)
 }
 
-/// Build a CSI arrow-key sequence with optional Ctrl/Shift modifiers.
-fn csi_arrow(direction: &str, ctrl: bool, shift: bool) -> Vec<u8> {
-    let seq = match (ctrl, shift) {
-        (true, _)    => format!("\x1b[1;5{direction}"),
-        (false, true) => format!("\x1b[1;2{direction}"),
-        (false, false) => format!("\x1b[{direction}"),
+/// Build a CSI arrow-key sequence with xterm's modifier parameter
+/// (1 = none, 2 = shift, 3 = alt, 4 = shift+alt, 5 = ctrl, 6 = shift+ctrl,
+/// 7 = ctrl+alt, 8 = shift+ctrl+alt).
+fn csi_arrow(direction: &str, ctrl: bool, shift: bool, alt: bool) -> Vec<u8> {
+    mod_aware_csi(direction, ctrl, shift, alt)
+}
+
+/// Shared builder for `CSI 1;<mods><final>` sequences (arrows, Home, End).
+fn mod_aware_csi(final_byte: &str, ctrl: bool, shift: bool, alt: bool) -> Vec<u8> {
+    let code = modifier_code(shift, alt, ctrl);
+    let seq = if code == 1 {
+        format!("\x1b[{final_byte}")
+    } else {
+        format!("\x1b[1;{code}{final_byte}")
     };
     seq.into_bytes()
 }
 
+/// Shared builder for `CSI <n>;<mods>~` sequences (PageUp/PageDown/Delete/Insert).
+fn mod_aware_tilde(n: u8, ctrl: bool, shift: bool, alt: bool) -> Vec<u8> {
+    let code = modifier_code(shift, alt, ctrl);
+    if code == 1 {
+        format!("\x1b[{n}~").into_bytes()
+    } else {
+        format!("\x1b[{n};{code}~").into_bytes()
+    }
+}
+
+/// xterm's numeric modifier encoding for CSI sequences.
+fn modifier_code(shift: bool, alt: bool, ctrl: bool) -> u8 {
+    1 + (shift as u8) + ((alt as u8) << 1) + ((ctrl as u8) << 2)
+}
+
 fn ctrl_char_to_byte(c: char) -> Option<u8> {
     let b = c as u32;
-    if b < 0x80 {
-        let mask = b & 0x1f;
-        Some(mask as u8)
-    } else {
-        None
+    if b >= 0x80 {
+        return None;
+    }
+    // Follow xterm's table exactly: letters and @[\]^_ fold with & 0x1f,
+    // space and the shifted-punctuation digits map to their C0 counterparts.
+    match b {
+        0x20 | 0x32 => Some(0x00), // Ctrl+Space / Ctrl+2 → NUL
+        0x40..=0x5f => Some((b & 0x1f) as u8), // @A-Z[\]^_ → classic C0
+        0x61..=0x7a => Some((b & 0x1f) as u8), // a-z → same as A-Z
+        0x3f | 0x38 => Some(0x7f), // Ctrl+? / Ctrl+8 → DEL
+        0x2f | 0x37 => Some(0x1f), // Ctrl+/ / Ctrl+7 → US
+        0x33 => Some(0x1b),        // Ctrl+3 → ESC
+        0x34 => Some(0x1c),        // Ctrl+4 → FS
+        0x35 => Some(0x1d),        // Ctrl+5 → GS
+        0x36 => Some(0x1e),        // Ctrl+6 → RS
+        _ => None,                 // no control form (digits/punctuation) → drop
     }
 }
 
@@ -188,6 +234,10 @@ fn f_key_seq(n: u8) -> Vec<u8> {
         b"\x1b[23~", // F11
         b"\x1b[24~", // F12
     ];
+    // F(0) isn't a real key; `get` handles it via the checked subtract below.
+    if n == 0 {
+        return Vec::new();
+    }
     F_KEY_SEQS.get(n as usize - 1)
         .map(|s| s.to_vec())
         .unwrap_or_default()
@@ -294,5 +344,85 @@ mod tests {
         let ev = KeyEvent::new(KeyCode::Char('P'), KeyModifiers::CONTROL | KeyModifiers::SHIFT);
         let action = router.handle(ev, &mut manager, &config, 40, 10);
         assert_eq!(action, InputAction::OpenPalette);
+    }
+
+    #[test]
+    fn clipboard_chords_return_command_for_app_layer() {
+        let mut manager = TerminalManager::new(&Config::default());
+        let config = Config::default();
+        let mut router = InputRouter::new(KeyBindingTable::defaults());
+
+        // Ctrl+Shift+C must come back as a Command for App::run_command —
+        // the router has no clipboard access. Regression: these used to be
+        // silently swallowed by manager.execute (which ignores clipboard
+        // commands), so the copy/paste bindings did nothing.
+        let ev = KeyEvent::new(KeyCode::Char('C'), KeyModifiers::CONTROL | KeyModifiers::SHIFT);
+        assert_eq!(
+            router.handle(ev, &mut manager, &config, 40, 10),
+            InputAction::Command(Command::CopySelection)
+        );
+        let ev = KeyEvent::new(KeyCode::Char('V'), KeyModifiers::CONTROL | KeyModifiers::SHIFT);
+        assert_eq!(
+            router.handle(ev, &mut manager, &config, 40, 10),
+            InputAction::Command(Command::PasteClipboard)
+        );
+    }
+
+    #[test]
+    fn alt_arrow_uses_modifier_parameter() {
+        // Alt+Up → CSI 1;3A (xterm's modifier 3 = alt).
+        let ev = KeyEvent::new(KeyCode::Up, KeyModifiers::ALT);
+        assert_eq!(key_to_bytes(ev).unwrap(), b"\x1b[1;3A");
+        // Ctrl+Shift+Left → CSI 1;6D.
+        let ev = KeyEvent::new(KeyCode::Left, KeyModifiers::CONTROL | KeyModifiers::SHIFT);
+        assert_eq!(key_to_bytes(ev).unwrap(), b"\x1b[1;6D");
+    }
+
+    #[test]
+    fn alt_enter_prepends_esc() {
+        let ev = KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT);
+        assert_eq!(key_to_bytes(ev).unwrap(), b"\x1b\r");
+    }
+
+    #[test]
+    fn modified_home_end_page_keys() {
+        // Alt+Home → CSI 1;3H.
+        let ev = KeyEvent::new(KeyCode::Home, KeyModifiers::ALT);
+        assert_eq!(key_to_bytes(ev).unwrap(), b"\x1b[1;3H");
+        // Ctrl+PageUp → CSI 5;5~.
+        let ev = KeyEvent::new(KeyCode::PageUp, KeyModifiers::CONTROL);
+        assert_eq!(key_to_bytes(ev).unwrap(), b"\x1b[5;5~");
+        // Unmodified forms stay compact.
+        let ev = KeyEvent::new(KeyCode::PageUp, KeyModifiers::empty());
+        assert_eq!(key_to_bytes(ev).unwrap(), b"\x1b[5~");
+        let ev = KeyEvent::new(KeyCode::Home, KeyModifiers::empty());
+        assert_eq!(key_to_bytes(ev).unwrap(), b"\x1b[H");
+    }
+
+    #[test]
+    fn ctrl_digits_match_xterm_table() {
+        // Ctrl+2 → NUL (the old blanket `& 0x1f` produced 0x12 = Ctrl+R).
+        let ev = KeyEvent::new(KeyCode::Char('2'), KeyModifiers::CONTROL);
+        assert_eq!(key_to_bytes(ev).unwrap(), vec![0x00]);
+        // Ctrl+3 → ESC.
+        let ev = KeyEvent::new(KeyCode::Char('3'), KeyModifiers::CONTROL);
+        assert_eq!(key_to_bytes(ev).unwrap(), vec![0x1b]);
+        // Ctrl+7 → US.
+        let ev = KeyEvent::new(KeyCode::Char('7'), KeyModifiers::CONTROL);
+        assert_eq!(key_to_bytes(ev).unwrap(), vec![0x1f]);
+        // Ctrl+8 → DEL.
+        let ev = KeyEvent::new(KeyCode::Char('8'), KeyModifiers::CONTROL);
+        assert_eq!(key_to_bytes(ev).unwrap(), vec![0x7f]);
+        // Ctrl+9: no control form in xterm's table → dropped.
+        let ev = KeyEvent::new(KeyCode::Char('9'), KeyModifiers::CONTROL);
+        assert_eq!(key_to_bytes(ev), None);
+    }
+
+    #[test]
+    fn unknown_function_keys_do_not_route_empty_writes() {
+        let ev = KeyEvent::new(KeyCode::F(0), KeyModifiers::empty());
+        assert_eq!(key_to_bytes(ev).unwrap(), Vec::<u8>::new());
+        let ev = KeyEvent::new(KeyCode::F(13), KeyModifiers::empty());
+        assert_eq!(key_to_bytes(ev).unwrap(), Vec::<u8>::new());
     }
 }

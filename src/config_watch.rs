@@ -35,7 +35,7 @@
 //! ## What gets applied
 //!
 //! - `ui.*` (theme, tabbar height, focus model)
-//! - `terminal.scrolling_history` (affects new tabs only)
+//! - `terminal.scrollback` (affects new tabs only)
 //! - `profiles.*` (used when opening new tabs)
 //! - `macros.*`
 //! - `transparency.*`

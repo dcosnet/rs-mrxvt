@@ -74,6 +74,14 @@ fn run(cli: Cli) -> Result<i32> {
 
     let backend = cli.backend;
     let mut app = App::new(cli, config)?;
+
+    // Config hot-reload: poll the config file for edits and apply updates
+    // in the main loop. 2s polling is ~0% CPU for a single small file.
+    // A failure here (unreadable path, etc.) disables hot reload only.
+    if let Err(e) = app.start_config_watcher(2000) {
+        log::warn!("config hot-reload unavailable: {e}");
+    }
+
     run_with_backend(&mut app, backend)
 }
 

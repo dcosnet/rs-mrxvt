@@ -28,11 +28,39 @@ osc52_read = false           # allow programs (tmux/nvim) to READ the clipboard
 # UI behavior
 # ──────────────────────────────────────────────────────────────────────────
 [ui]
-always_show_tabs = true     # show the tab bar even with one tab
+always_show_tabs = true     # reserved (not honored by renderers yet)
 disable_palette = false     # set true to disable Ctrl+Shift+P
-tabbar_height = 1           # tab bar height in terminal rows
-theme = "mrxvt"             # "mrxvt" (classic green-on-black) | "tokyo-night" | "gruvbox"
-focus = "click"             # "click" (default) | "follow" (focus follows mouse)
+tabbar_height = 1           # tab bar height in terminal rows (TUI backend)
+theme = "mrxvt"             # built-ins: mrxvt | tokyo-night | gruvbox |
+                            # dracula | solarized-dark | solarized-light,
+                            # or a name from [custom_themes.*] below
+focus = "click"             # reserved (not honored by renderers yet)
+
+# ──────────────────────────────────────────────────────────────────────────
+# Custom themes: full palette (16 ANSI colors + bg/fg/cursor, #RRGGBB),
+# referenced by name from ui.theme. A custom theme overrides a built-in
+# of the same name.
+# ──────────────────────────────────────────────────────────────────────────
+# [custom_themes.midnight]
+# bg = "#0a0e14"
+# fg = "#c5cdd7"
+# cursor = "#c5cdd7"
+# black = "#0a0e14"
+# red = "#f07178"
+# green = "#86b300"
+# yellow = "#f2ae49"
+# blue = "#399ee6"
+# magenta = "#a37acc"
+# cyan = "#4cbf99"
+# white = "#c5cdd7"
+# bright_black = "#565b66"
+# bright_red = "#f07178"
+# bright_green = "#86b300"
+# bright_yellow = "#f2ae49"
+# bright_blue = "#399ee6"
+# bright_magenta = "#a37acc"
+# bright_cyan = "#4cbf99"
+# bright_white = "#ffffff"
 
 # ──────────────────────────────────────────────────────────────────────────
 # Default profile (used when rs-mrxvt is launched with no -e flag)
@@ -85,17 +113,22 @@ command = ["htop"]
 env = { HTOPRC = "/home/user/.config/htop/mrxvt-rc" }
 
 # ──────────────────────────────────────────────────────────────────────────
-# Macros: chord → command name (must match a `Command` variant)
+# Macros: chord → command spec. Bare names cover parameterless commands;
+# parameterized commands take the argument after a colon (e.g. ":web").
 # ──────────────────────────────────────────────────────────────────────────
 [macros]
 "Ctrl+Shift+R" = "ResetTerminal"
 # "Ctrl+Shift+B" = "ToggleBroadcastAll"
+# "Ctrl+Shift+G" = "ToggleBroadcastGroup:web"
+# "Alt+T" = "TagActiveTab:web"
+# "Alt+H" = "NewTabProfile:monitoring"
 
 # ──────────────────────────────────────────────────────────────────────────
-# Pseudo-transparency + tinting (requires --features gpu + a GUI backend)
+# Pseudo-transparency + tinting — schema parses, but no renderer consumes
+# it yet (planned; see README roadmap). Settings currently have no effect.
 # ──────────────────────────────────────────────────────────────────────────
 [transparency]
-enabled = false              # set true to enable
+enabled = false              # set true to enable (once wired)
 tint = "#004080"              # tint color as #RRGGBB
 opacity = 0.85                # 0.0 (invisible) to 1.0 (opaque)
 # background_image = "/path/to/wallpaper.png"   # optional

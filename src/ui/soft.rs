@@ -74,6 +74,9 @@ pub struct SoftRenderer {
     event_loop: EventLoop<()>,
     /// Tracks keyboard modifier state (updated by ModifiersChanged events).
     mod_tracker: crate::ui::event::winit_translate::ModifierTracker,
+    /// Tracks mouse state (last cursor position, held button) so button
+    /// events can be translated into grid-cell coordinates.
+    mouse_tracker: crate::ui::event::winit_translate::MouseTracker,
     #[allow(dead_code)]
     context: softbuffer::Context<Arc<winit::window::Window>>,
     surface: softbuffer::Surface<Arc<winit::window::Window>, Arc<winit::window::Window>>,
@@ -116,6 +119,7 @@ impl SoftRenderer {
             window,
             event_loop,
             mod_tracker: Default::default(),
+            mouse_tracker: Default::default(),
             context,
             surface,
             glyph_cache,
@@ -146,17 +150,21 @@ impl Renderer for SoftRenderer {
         // appears as a blank form.
         let mut collected: Vec<crate::ui::event::AppEvent> = Vec::new();
         let mut tracker = self.mod_tracker;
+        let mut mouse = self.mouse_tracker;
+        let (cols, rows) = self.size();
         let timeout = Some(std::time::Duration::from_millis(timeout_ms));
 
         let status = self.event_loop.pump_events(timeout, |event, elwt| {
             if let Some(app_ev) = crate::ui::event::winit_translate::translate_event(
-                &event, &mut tracker, elwt,
+                &event, &mut tracker, &mut mouse, elwt,
+                CELL_WIDTH, CELL_HEIGHT, cols, rows,
             ) {
                 collected.push(app_ev);
             }
         });
 
         self.mod_tracker = tracker;
+        self.mouse_tracker = mouse;
 
         if let PumpStatus::Exit(_) = status {
             collected.push(crate::ui::event::AppEvent::Quit);
@@ -183,12 +191,17 @@ impl Renderer for SoftRenderer {
                 .map_err(|e| anyhow::anyhow!("resizing softbuffer surface: {e}"))?;
         }
 
+        // Resolve the configured theme once per frame (hot-reload picks it
+        // up on the next frame automatically).
+        let theme = crate::theme::resolve(&app.config.ui.theme, &app.config.custom_themes)
+            .unwrap_or_else(crate::theme::default_theme);
+
         // Build a tiny-skia Pixmap to render into.
         let mut pixmap = tiny_skia::Pixmap::new(size.width, size.height)
             .ok_or_else(|| anyhow::anyhow!("creating pixmap of {}x{}", size.width, size.height))?;
 
-        // Fill background (classic mrxvt dark green-tinted black).
-        pixmap.fill(tiny_skia::Color::from_rgba8(5, 10, 5, 255));
+        // Fill background with the theme's background color.
+        pixmap.fill(tiny_skia::Color::from_rgba8(theme.bg.r, theme.bg.g, theme.bg.b, 255));
 
         // Draw the terminal grid + chrome.
         let manager = &app.manager;
@@ -202,7 +215,17 @@ impl Renderer for SoftRenderer {
 
         // Render the active terminal grid.
         if let Some(tab) = manager.tabs.get(active_idx) {
-            render_terminal_grid(&mut pixmap, &mut self.glyph_cache, tab, 0, term_y, size.width, term_h);
+            render_terminal_grid(
+                &mut pixmap,
+                &mut self.glyph_cache,
+                tab,
+                &app.session.selection,
+                &theme,
+                0,
+                term_y,
+                size.width,
+                term_h,
+            );
         }
 
         // Render tab bar (just text labels for now).
@@ -262,15 +285,23 @@ impl BackendFactory for SoftFactory {
 
 // ─── Rendering helpers ───────────────────────────────────────────────────────
 
+/// Selection highlight tint (matches the TUI backend's Rgb(60, 71, 100)).
+const SELECTION_TINT: (u8, u8, u8, u8) = (60, 71, 100, 255);
+
+#[allow(clippy::too_many_arguments)] // mirrors the wgpu builder's state bundle
 fn render_terminal_grid(
     pixmap: &mut tiny_skia::Pixmap,
     cache: &mut GlyphCache,
     tab: &crate::terminal::TerminalTab,
+    selection: &crate::mouse::Selection,
+    theme: &crate::theme::Theme,
     x: u32,
     y: u32,
     width: u32,
     height: u32,
 ) {
+    use alacritty_terminal::term::TermMode;
+
     let grid = tab.term.grid();
     let cols = (width / CELL_WIDTH) as usize;
     let rows = (height / CELL_HEIGHT) as usize;
@@ -279,8 +310,24 @@ fn render_terminal_grid(
     let start_line = -(display_offset as i32);
     let render_rows = rows.min(screen_lines);
 
+    // Block cursor position (viewport row), if visible.
+    let show_cursor = tab.term.mode().contains(TermMode::SHOW_CURSOR);
+    let cursor_pos: Option<(usize, usize)> = show_cursor
+        .then(|| {
+            let c = &grid.cursor.point;
+            let row = c.line.0 + start_line;
+            let col = c.column.0;
+            (row >= 0 && (row as usize) < render_rows && col < cols).then_some((row as usize, col))
+        })
+        .flatten();
+
     for row_idx in 0..render_rows as i32 {
         let line = ALine(start_line + row_idx);
+        let sel_span = if selection.is_active() {
+            selection.line_span(line.0, cols)
+        } else {
+            None
+        };
         for col_idx in 0..cols {
             let point = Point { line, column: Column(col_idx) };
             let cell: &Cell = &grid[point];
@@ -288,13 +335,36 @@ fn render_terminal_grid(
             let cell_x = x + (col_idx as u32) * CELL_WIDTH;
             let cell_y = y + (row_idx as u32) * CELL_HEIGHT;
 
+            // The INVERSE flag means the renderer swaps fg/bg; the DIM flag
+            // scales the foreground down. Selection replaces the background
+            // tint (inverse suppressed), and the cursor cell reverses.
+            let (mut fg, mut bg) = (ansi_to_rgba(cell.fg, theme), ansi_to_rgba(cell.bg, theme));
+            if cell.flags.contains(alacritty_terminal::term::cell::Flags::INVERSE) {
+                std::mem::swap(&mut fg, &mut bg);
+            }
+            if cell.flags.contains(alacritty_terminal::term::cell::Flags::DIM) {
+                fg = (
+                    (fg.0 as u32 * 6 / 10) as u8,
+                    (fg.1 as u32 * 6 / 10) as u8,
+                    (fg.2 as u32 * 6 / 10) as u8,
+                    255,
+                );
+            }
+            let selected = sel_span
+                .map(|(a, b)| col_idx >= a && col_idx < b)
+                .unwrap_or(false);
+            if selected {
+                bg = SELECTION_TINT;
+            }
+            if cursor_pos == Some((row_idx as usize, col_idx)) {
+                std::mem::swap(&mut fg, &mut bg);
+            }
+
             // Fill cell background.
-            let bg = ansi_to_rgba(cell.bg);
             fill_rect(pixmap, cell_x, cell_y, CELL_WIDTH, CELL_HEIGHT, bg);
 
             // Render the glyph.
             if cell.c != ' ' && cell.c != '\0' {
-                let fg = ansi_to_rgba(cell.fg);
                 draw_glyph(
                     pixmap,
                     cache,
@@ -322,8 +392,10 @@ fn render_tab_bar(
 
     let mut x: u32 = 4;
     for (i, tab) in manager.tabs.iter().enumerate() {
-        let label = format!("{}: {}", i + 1, tab.title);
         let active = i == manager.active;
+        let marker = if active { "*" } else { " " };
+        let tag_str = tab.tag.as_ref().map(|g| format!("[{g}]")).unwrap_or_default();
+        let label = format!("{marker} {}: {}{}", i + 1, tab.title, tag_str);
         let fg = if active { (255, 255, 255, 255) } else { (150, 150, 150, 255) };
 
         // Draw a separator.
@@ -334,7 +406,7 @@ fn render_tab_bar(
 
         // Draw the label.
         for c in label.chars() {
-            draw_glyph(pixmap, cache, c, x, 0, fg, false, false);
+            draw_glyph(pixmap, cache, c, x, 0, fg, active, false);
             x += CELL_WIDTH;
             if x >= width {
                 return;
@@ -403,11 +475,13 @@ fn draw_glyph(
     let g = cache.get(c, bold, italic);
     let (r, gr, b, _a) = color;
 
-    // Center the glyph in the cell.
-    let offset_x = ((CELL_WIDTH as i32 - g.width as i32) / 2).max(0) as u32;
-    let offset_y = ((CELL_HEIGHT as i32 - g.height as i32) / 2).max(0) as u32;
-    let start_x = cell_x + offset_x;
-    let start_y = cell_y + offset_y;
+    // Position the glyph on the shared baseline (same rule as the wgpu
+    // backend) so both rasterizers draw identical layouts. Centering the
+    // bitmap in the cell ignores the font's bearings and makes tall glyphs
+    // (|, brackets) sit visibly higher than short ones.
+    let baseline = CELL_HEIGHT as f32 - 3.0;
+    let start_x = cell_x + g.bearing_x.max(0.0) as u32;
+    let start_y = cell_y + (baseline + g.bearing_y).max(0.0) as u32;
 
     // Composite the glyph onto the pixmap (alpha-blend over background).
     let pm_w = pixmap.width();
@@ -489,55 +563,57 @@ fn fill_rect(
     }
 }
 
-fn ansi_to_rgba(c: AnsiColor) -> (u8, u8, u8, u8) {
+fn ansi_to_rgba(c: AnsiColor, theme: &crate::theme::Theme) -> (u8, u8, u8, u8) {
     match c {
-        AnsiColor::Named(n) => named_to_rgba(n),
+        AnsiColor::Named(n) => named_to_rgba(n, theme),
         AnsiColor::Spec(rgb) => (rgb.r, rgb.g, rgb.b, 255),
-        AnsiColor::Indexed(i) => match i {
-            0 => (0, 0, 0, 255),
-            1 => (205, 0, 0, 255),
-            2 => (0, 205, 0, 255),
-            3 => (205, 205, 0, 255),
-            4 => (0, 0, 238, 255),
-            5 => (205, 0, 205, 255),
-            6 => (0, 205, 205, 255),
-            7 => (229, 229, 229, 255),
-            8 => (127, 127, 127, 255),
-            9 => (255, 0, 0, 255),
-            10 => (0, 255, 0, 255),
-            11 => (255, 255, 0, 255),
-            12 => (92, 92, 255, 255),
-            13 => (255, 0, 255, 255),
-            14 => (0, 255, 255, 255),
-            15 => (255, 255, 255, 255),
-            _ => (200, 200, 200, 255),
-        },
+        AnsiColor::Indexed(i) => {
+            // First 16 indices come from the theme; 216-cube + grayscale are
+            // fixed hardware palettes.
+            if i < 16 {
+                let t = theme.ansi(i);
+                (t.r, t.g, t.b, 255)
+            } else if (16..232).contains(&i) {
+                let j = i - 16;
+                let r = (j / 36) % 6;
+                let g = (j / 6) % 6;
+                let b = j % 6;
+                let to_byte = |v: u8| if v == 0 { 0 } else { 55 + v * 40 };
+                (to_byte(r), to_byte(g), to_byte(b), 255)
+            } else {
+                let v = 8 + (i - 232) * 10;
+                (v, v, v, 255)
+            }
+        }
     }
 }
 
-fn named_to_rgba(n: NamedColor) -> (u8, u8, u8, u8) {
+fn named_to_rgba(n: NamedColor, theme: &crate::theme::Theme) -> (u8, u8, u8, u8) {
+    let rgb = |c: crate::theme::Color| (c.r, c.g, c.b, 255u8);
     use NamedColor::*;
     match n {
-        Black => (0, 0, 0, 255),
-        Red => (205, 0, 0, 255),
-        Green => (0, 205, 0, 255),
-        Yellow => (205, 205, 0, 255),
-        Blue => (0, 0, 238, 255),
-        Magenta => (205, 0, 205, 255),
-        Cyan => (0, 205, 205, 255),
-        White => (229, 229, 229, 255),
-        BrightBlack => (127, 127, 127, 255),
-        BrightRed => (255, 0, 0, 255),
-        BrightGreen => (0, 255, 0, 255),
-        BrightYellow => (255, 255, 0, 255),
-        BrightBlue => (92, 92, 255, 255),
-        BrightMagenta => (255, 0, 255, 255),
-        BrightCyan => (0, 255, 255, 255),
-        BrightWhite => (255, 255, 255, 255),
-        BrightForeground => (255, 255, 255, 255),
-        Foreground => (229, 229, 229, 255),
-        Background => (5, 10, 5, 255),
-        Cursor => (255, 255, 255, 255),
+        Black => rgb(theme.black),
+        Red => rgb(theme.red),
+        Green => rgb(theme.green),
+        Yellow => rgb(theme.yellow),
+        Blue => rgb(theme.blue),
+        Magenta => rgb(theme.magenta),
+        Cyan => rgb(theme.cyan),
+        White => rgb(theme.white),
+        BrightBlack => rgb(theme.bright_black),
+        BrightRed => rgb(theme.bright_red),
+        BrightGreen => rgb(theme.bright_green),
+        BrightYellow => rgb(theme.bright_yellow),
+        BrightBlue => rgb(theme.bright_blue),
+        BrightMagenta => rgb(theme.bright_magenta),
+        BrightCyan => rgb(theme.bright_cyan),
+        BrightWhite => rgb(theme.bright_white),
+        BrightForeground => rgb(theme.fg),
+        Foreground => rgb(theme.fg),
+        Background => rgb(theme.bg),
+        Cursor => rgb(theme.cursor),
+        // Dim* variants map to their base color (dimming is applied to the
+        // fg in render_terminal_grid).
         _ => (200, 200, 200, 255),
     }
 }

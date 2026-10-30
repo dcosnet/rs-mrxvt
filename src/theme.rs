@@ -20,15 +20,16 @@
 
 //! True-color theme presets.
 //!
-//! Each theme defines 18 colors: the 16 ANSI colors (0-15), plus a
+//! Each theme defines 19 colors: the 16 ANSI colors (0-15), plus a
 //! foreground, background, and cursor color. Themes are applied by the
 //! renderers when translating `alacritty_terminal`'s `NamedColor` enum
-//! into actual RGB values.
+//! into actual RGB values; the TUI renderer resolves `ui.theme` once per
+//! frame, so config hot-reload switches themes live.
 //!
 //! ## Built-in presets
 //!
-//! - `mrxvt` — classic green-on-black (the original).
-//! - `tokyo-night` — Toki Night, a popular dark theme.
+//! - `mrxvt` — classic green-on-black (the default).
+//! - `tokyo-night` — Tokyo Night, a popular dark theme.
 //! - `gruvbox` — Gruvbox, warm retro colors.
 //! - `dracula` — Dracula, dark purple.
 //! - `solarized-dark` — Solarized Dark.
@@ -36,10 +37,14 @@
 //!
 //! ## Custom themes
 //!
-//! Users can define custom themes in TOML:
+//! Define a `[custom_themes.<name>]` table in config.toml with the full
+//! palette (colors as `#RRGGBB`):
 //!
 //! ```toml
-//! [theme.custom]
+//! [ui]
+//! theme = "midnight"
+//!
+//! [custom_themes.midnight]
 //! bg = "#1a1b26"
 //! fg = "#a9b1d6"
 //! cursor = "#c0caf5"
@@ -60,8 +65,6 @@
 //! bright_cyan = "#0db9d7"
 //! bright_white = "#acb0d0"
 //! ```
-//!
-//! Then set `ui.theme = "custom"`.
 
 use std::collections::HashMap;
 
@@ -70,6 +73,9 @@ use serde::{Deserialize, Serialize};
 /// A complete theme: 16 ANSI colors + bg/fg/cursor.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Theme {
+    /// Display name. Optional for custom themes parsed from config (the
+    /// table name is authoritative); filled in by [`resolve`].
+    #[serde(default)]
     pub name: String,
     pub bg: Color,
     pub fg: Color,
@@ -93,11 +99,30 @@ pub struct Theme {
 }
 
 /// An RGB color.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+///
+/// Deserializes from either a `#RRGGBB` hex string (the config-file form)
+/// or a `{ r = .., g = .., b = .. }` table.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, Hash)]
 pub struct Color {
     pub r: u8,
     pub g: u8,
     pub b: u8,
+}
+
+impl<'de> Deserialize<'de> for Color {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            Hex(String),
+            Rgb { r: u8, g: u8, b: u8 },
+        }
+        match Raw::deserialize(d)? {
+            Raw::Hex(s) => Color::parse(&s)
+                .ok_or_else(|| serde::de::Error::custom(format!("invalid hex color {s:?}"))),
+            Raw::Rgb { r, g, b } => Ok(Color::new(r, g, b)),
+        }
+    }
 }
 
 impl Color {
@@ -332,12 +357,23 @@ fn solarized_light() -> Theme {
 
 /// Resolve a theme by name, with optional custom themes from config.
 ///
-/// Custom themes take precedence over built-ins of the same name.
+/// Custom themes take precedence over built-ins of the same name; a custom
+/// theme without an explicit `name` field inherits the key it was defined
+/// under.
 pub fn resolve(name: &str, custom: &HashMap<String, Theme>) -> Option<Theme> {
     if let Some(t) = custom.get(name) {
-        return Some(t.clone());
+        let mut t = t.clone();
+        if t.name.is_empty() {
+            t.name = name.to_string();
+        }
+        return Some(t);
     }
     builtin(name)
+}
+
+/// The fallback theme used when a configured name doesn't resolve.
+pub fn default_theme() -> Theme {
+    builtin("mrxvt").expect("built-in mrxvt theme must exist")
 }
 
 #[cfg(test)]

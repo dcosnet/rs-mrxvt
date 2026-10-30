@@ -98,6 +98,16 @@ impl AppModifiers {
     pub fn empty() -> Self {
         Self::default()
     }
+
+    /// Drop the super key (which mouse reporting has no bit for) and map
+    /// to the backend-agnostic [`crate::mouse::MouseMods`].
+    pub fn into_mouse_mods(self) -> crate::mouse::MouseMods {
+        crate::mouse::MouseMods {
+            shift: self.shift,
+            ctrl: self.ctrl,
+            alt: self.alt,
+        }
+    }
 }
 
 impl std::fmt::Display for AppModifiers {
@@ -167,28 +177,47 @@ impl From<CrosstermMods> for AppModifiers {
     }
 }
 
+/// Translate a crossterm `KeyCode` into an [`AppKey`], returning `None` for
+/// keys this app doesn't understand (the caller drops them instead of
+/// injecting a bogus keystroke into the shell).
+pub fn app_key_from_crossterm(c: CrosstermCode) -> Option<AppKey> {
+    match c {
+        CrosstermCode::Char(c) => Some(AppKey::Char(c)),
+        CrosstermCode::Enter => Some(AppKey::Enter),
+        CrosstermCode::Tab => Some(AppKey::Tab),
+        CrosstermCode::BackTab => Some(AppKey::BackTab),
+        CrosstermCode::Backspace => Some(AppKey::Backspace),
+        CrosstermCode::Esc => Some(AppKey::Esc),
+        CrosstermCode::Left => Some(AppKey::Left),
+        CrosstermCode::Right => Some(AppKey::Right),
+        CrosstermCode::Up => Some(AppKey::Up),
+        CrosstermCode::Down => Some(AppKey::Down),
+        CrosstermCode::Home => Some(AppKey::Home),
+        CrosstermCode::End => Some(AppKey::End),
+        CrosstermCode::PageUp => Some(AppKey::PageUp),
+        CrosstermCode::PageDown => Some(AppKey::PageDown),
+        CrosstermCode::Delete => Some(AppKey::Delete),
+        CrosstermCode::Insert => Some(AppKey::Insert),
+        CrosstermCode::F(n) => Some(AppKey::F(n)),
+        _ => None,
+    }
+}
+
 impl From<CrosstermCode> for AppKey {
     fn from(c: CrosstermCode) -> Self {
-        match c {
-            CrosstermCode::Char(c) => AppKey::Char(c),
-            CrosstermCode::Enter => AppKey::Enter,
-            CrosstermCode::Tab => AppKey::Tab,
-            CrosstermCode::BackTab => AppKey::BackTab,
-            CrosstermCode::Backspace => AppKey::Backspace,
-            CrosstermCode::Esc => AppKey::Esc,
-            CrosstermCode::Left => AppKey::Left,
-            CrosstermCode::Right => AppKey::Right,
-            CrosstermCode::Up => AppKey::Up,
-            CrosstermCode::Down => AppKey::Down,
-            CrosstermCode::Home => AppKey::Home,
-            CrosstermCode::End => AppKey::End,
-            CrosstermCode::PageUp => AppKey::PageUp,
-            CrosstermCode::PageDown => AppKey::PageDown,
-            CrosstermCode::Delete => AppKey::Delete,
-            CrosstermCode::Insert => AppKey::Insert,
-            CrosstermCode::F(n) => AppKey::F(n),
-            _ => AppKey::Char(' '), // unknown → space (rare)
-        }
+        app_key_from_crossterm(c).unwrap_or(AppKey::Char(' '))
+    }
+}
+
+impl AppKeyEvent {
+    /// Like `From<CrosstermKey>`, but drops unrecognised keys instead of
+    /// mapping them to a space (which would type into the shell).
+    pub fn try_from_crossterm(ev: CrosstermKey) -> Option<Self> {
+        Some(Self {
+            mods: AppModifiers::from(ev.modifiers),
+            key: app_key_from_crossterm(ev.code)?,
+            released: false,
+        })
     }
 }
 
@@ -216,7 +245,7 @@ pub mod winit_translate {
     use winit::event_loop::EventLoopWindowTarget;
     use winit::keyboard::{Key, ModifiersState, NamedKey};
 
-    use super::{AppEvent, AppKey, AppKeyEvent, AppModifiers};
+    use super::{AppEvent, AppKey, AppKeyEvent, AppModifiers, AppMouseEvent};
 
     /// Tracks the current keyboard modifier state.
     ///
@@ -240,6 +269,17 @@ pub mod winit_translate {
                 super_key: self.mods.super_key(),
             }
         }
+    }
+
+    /// Tracks mouse state across winit events.
+    ///
+    /// winit's `MouseInput` events carry no cursor position, so the last
+    /// `CursorMoved` position is remembered here and used for button events.
+    /// `left_down` distinguishes drag motion from hover motion.
+    #[derive(Clone, Copy, Default)]
+    pub struct MouseTracker {
+        last_pos: winit::dpi::PhysicalPosition<f64>,
+        left_down: bool,
     }
 
     /// Translate a winit `KeyEvent` into an `AppKeyEvent`.
@@ -300,24 +340,42 @@ pub mod winit_translate {
     /// Translate a top-level winit `Event` into an `AppEvent`.
     ///
     /// `tracker` is updated in place when modifier-state events arrive.
+    /// `mouse` is updated by cursor/button events and used to synthesize
+    /// `AppEvent::Mouse` in *grid* coordinates (the 1-cell tab bar at the top
+    /// and 1-cell status bar at the bottom of the GUI layout are stripped,
+    /// matching what `App::handle_mouse` and the child program expect).
+    /// `cols`/`rows` are the grid area dimensions from `Renderer::size()`.
     /// Returns `None` for events that don't map to an `AppEvent` (most
     /// events — winit emits a lot of internal events we don't care about).
+    #[allow(clippy::too_many_arguments)] // trackers + geometry; grouping would obscure the call sites
     pub fn translate_event(
         event: &Event<()>,
         tracker: &mut ModifierTracker,
-        _elwt: &EventLoopWindowTarget<()>,
+        mouse: &mut MouseTracker,
+        elwt: &EventLoopWindowTarget<()>,
+        cell_w: u32,
+        cell_h: u32,
+        cols: u16,
+        rows: u16,
     ) -> Option<AppEvent> {
         match event {
             Event::WindowEvent { event: win_ev, .. } => {
-                translate_window_event(win_ev, tracker)
+                translate_window_event(win_ev, tracker, mouse, elwt, cell_w, cell_h, cols, rows)
             }
             _ => None,
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn translate_window_event(
         win_ev: &WindowEvent,
         tracker: &mut ModifierTracker,
+        mouse: &mut MouseTracker,
+        _elwt: &EventLoopWindowTarget<()>,
+        cell_w: u32,
+        cell_h: u32,
+        cols: u16,
+        rows: u16,
     ) -> Option<AppEvent> {
         match win_ev {
             WindowEvent::CloseRequested => Some(AppEvent::Quit),
@@ -337,6 +395,49 @@ pub mod winit_translate {
             WindowEvent::ModifiersChanged(mods) => {
                 tracker.update(mods.state());
                 None // modifier changes are state, not actions
+            }
+
+            WindowEvent::CursorMoved { position, .. } => {
+                mouse.last_pos = *position;
+                let button = if mouse.left_down {
+                    crate::mouse::MouseButton::Left
+                } else {
+                    crate::mouse::MouseButton::None
+                };
+                mouse_app_event(mouse, button, crate::mouse::MouseEventKind::Motion,
+                                tracker, cell_w, cell_h, cols, rows)
+            }
+
+            WindowEvent::MouseInput { state, button, .. } => {
+                let app_button = match button {
+                    winit::event::MouseButton::Left => crate::mouse::MouseButton::Left,
+                    winit::event::MouseButton::Middle => crate::mouse::MouseButton::Middle,
+                    winit::event::MouseButton::Right => crate::mouse::MouseButton::Right,
+                    // Back/Forward/Other buttons have no terminal meaning.
+                    _ => crate::mouse::MouseButton::None,
+                };
+                if app_button == crate::mouse::MouseButton::Left {
+                    mouse.left_down = *state == ElementState::Pressed;
+                }
+                let kind = match state {
+                    ElementState::Pressed => crate::mouse::MouseEventKind::Press,
+                    ElementState::Released => crate::mouse::MouseEventKind::Release,
+                };
+                mouse_app_event(mouse, app_button, kind, tracker, cell_w, cell_h, cols, rows)
+            }
+
+            WindowEvent::MouseWheel { delta, .. } => {
+                let up = match delta {
+                    winit::event::MouseScrollDelta::LineDelta(_, y) => *y > 0.0,
+                    winit::event::MouseScrollDelta::PixelDelta(p) => p.y > 0.0,
+                };
+                let button = if up {
+                    crate::mouse::MouseButton::WheelUp
+                } else {
+                    crate::mouse::MouseButton::WheelDown
+                };
+                mouse_app_event(mouse, button, crate::mouse::MouseEventKind::Press,
+                                tracker, cell_w, cell_h, cols, rows)
             }
 
             WindowEvent::KeyboardInput { event, .. } => {
@@ -363,6 +464,40 @@ pub mod winit_translate {
             _ => None,
         }
     }
+
+    /// Build an [`AppMouseEvent`] from the tracker's last cursor position,
+    /// converting physical pixels to grid cells (tab bar stripped) and
+    /// dropping events outside the grid area.
+    #[allow(clippy::too_many_arguments)]
+    fn mouse_app_event(
+        mouse: &MouseTracker,
+        button: crate::mouse::MouseButton,
+        kind: crate::mouse::MouseEventKind,
+        tracker: &ModifierTracker,
+        cell_w: u32,
+        cell_h: u32,
+        cols: u16,
+        rows: u16,
+    ) -> Option<AppEvent> {
+        if cell_w == 0 || cell_h == 0 || cols == 0 || rows == 0 {
+            return None;
+        }
+        let col = (mouse.last_pos.x / cell_w as f64) as i64;
+        // Strip the tab bar row, then index the remaining area.
+        let row = ((mouse.last_pos.y - cell_h as f64) / cell_h as f64) as i64;
+        if col < 0 || row < 0 {
+            return None; // above the grid (tab bar / title bar)
+        }
+        let col = (col as u32).min(cols as u32 - 1);
+        let row = (row as u32).min(rows as u32 - 1);
+        Some(AppEvent::Mouse(AppMouseEvent {
+            button,
+            col,
+            row,
+            mods: tracker.to_app_modifiers().into_mouse_mods(),
+            kind,
+        }))
+    }
 }
 
 #[cfg(test)]
@@ -384,6 +519,20 @@ mod tests {
         let app_ev: AppKeyEvent = ev.into();
         assert_eq!(app_ev.key, AppKey::Up);
         assert!(app_ev.mods.shift);
+    }
+
+    #[test]
+    fn unknown_keys_are_dropped_not_typed_as_space() {
+        // KeyCode::Null (and other unrecognised codes) used to become
+        // AppKey::Char(' ') — injecting a space keystroke into the shell.
+        let ev = CrosstermKey::new(CrosstermCode::Null, CrosstermMods::empty());
+        assert!(AppKeyEvent::try_from_crossterm(ev).is_none());
+        let ev = CrosstermKey::new(CrosstermCode::CapsLock, CrosstermMods::empty());
+        assert!(AppKeyEvent::try_from_crossterm(ev).is_none());
+        // Known keys still translate.
+        let ev = CrosstermKey::new(CrosstermCode::Char('x'), CrosstermMods::empty());
+        let app_ev = AppKeyEvent::try_from_crossterm(ev).unwrap();
+        assert_eq!(app_ev.key, AppKey::Char('x'));
     }
 
     #[test]

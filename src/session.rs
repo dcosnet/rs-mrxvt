@@ -32,8 +32,10 @@
 //! - [`ImageStore`] — inline images (iTerm2 + Sixel), populated by the
 //!   PTY reader. Gated on the `images` feature.
 //!
-//! The renderers read this state each frame to draw selection highlights,
-//! underline hyperlinks, and composite inline images.
+//! The renderers read the selection each frame to draw highlights. The
+//! hyperlink and image stores are populated by the PTY reader and cleared
+//! on tab switches, but no renderer draws them yet (parser-level feature;
+//! see the roadmap in README.md).
 
 use std::time::{Duration, Instant};
 

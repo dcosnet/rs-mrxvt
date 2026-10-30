@@ -27,8 +27,9 @@
 //!
 //! ## Usage
 //!
-//! The renderers (wgpu, softbuffer) read this state per-tab and apply it as
-//! a brightness multiplier on the cell colors before drawing.
+//! Modeled and unit-tested, but no renderer consumes it yet — wiring this
+//! into the wgpu/softbuffer cell colors (brightness multiplier per tab) is
+//! planned work; see the roadmap in README.md.
 //!
 //! ## Lerp math
 //!

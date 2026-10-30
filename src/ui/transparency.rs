@@ -21,9 +21,11 @@
 //! Pseudo-transparency + tinting state.
 //!
 //! Implements the classic mrxvt `-tint` and `-sh` (shading) flags in a
-//! modern, shader-driven way. The state lives here; the wgpu backend
-//! consumes it via the [`TransparencyUniforms`] struct and the softbuffer
-//! backend reads it directly when compositing.
+//! modern, shader-driven way. The config schema, color parsing, and the
+//! [`TransparencyUniforms`] model (with the WGSL snippet the renderer
+//! would embed) live here and are unit-tested — **no renderer consumes
+//! them yet**. Wiring this into the wgpu pipeline is planned work; see
+//! the roadmap in README.md.
 //!
 //! ## Classic mrxvt semantics
 //!

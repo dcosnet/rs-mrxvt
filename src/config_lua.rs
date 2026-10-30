@@ -146,7 +146,7 @@ pub fn parse_lua_config(source: &str) -> Result<Config> {
             focus: opt_string(&t, "focus").unwrap_or_else(default_focus),
             always_show_tabs: opt_bool(&t, "always_show_tabs").unwrap_or(true),
             disable_palette: opt_bool(&t, "disable_palette").unwrap_or(false),
-            tabbar_height: opt_int(&t, "tabbar_height").unwrap_or(1),
+            tabbar_height: opt_int(&t, "tabbar_height").unwrap_or_else(crate::config::default_tabbar_height),
             theme: opt_string(&t, "theme").unwrap_or_else(default_theme),
         };
     }
@@ -294,7 +294,10 @@ fn default_cols() -> u16 { 80 }
 fn default_rows() -> u16 { 24 }
 fn default_scrollback() -> usize { 10_000 }
 fn default_shell() -> String {
-    std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into())
+    // Share the TOML resolver so both config formats agree on the default
+    // shell (bash → $SHELL → /bin/sh); a Lua config that omits `shell`
+    // used to silently differ from its TOML equivalent.
+    crate::config::default_shell()
 }
 fn default_focus() -> String { "click".into() }
 fn default_theme() -> String { "mrxvt".into() }

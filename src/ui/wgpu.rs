@@ -70,29 +70,25 @@ const ATLAS_PADDING: u32 = 1;
 
 /// Height of the tab bar in pixels (one cell row).
 const TAB_BAR_HEIGHT: u32 = CELL_HEIGHT;
-/// Height of the status bar in pixels (one cell row). Documented here for
-/// layout clarity; the status bar Y is computed from `total_rows` at render
-/// time, but this constant keeps the chrome-height intent explicit.
-#[allow(dead_code)]
+/// Height of the status bar in pixels (one cell row).
 const STATUS_BAR_HEIGHT: u32 = CELL_HEIGHT;
 
 // ─── Modern color palette (linear RGB, 0..1) ─────────────────────────────
 //
-// A clean dark theme with a cyan accent — modern without being garish.
-const COLOR_BG: [f32; 4] = [0.05, 0.05, 0.07, 1.0];          // window background
+// Chrome colors (tab bar / status bar) are fixed; grid cell colors come
+// from the configured theme (see `current_theme` / `ansi_to_linear`).
 const COLOR_TABBAR_BG: [f32; 4] = [0.10, 0.10, 0.13, 1.0];   // tab bar bg
 const COLOR_TAB_INACTIVE_BG: [f32; 4] = [0.12, 0.12, 0.16, 1.0];
 const COLOR_TAB_INACTIVE_FG: [f32; 4] = [0.55, 0.55, 0.62, 1.0];
 const COLOR_TAB_ACTIVE_BG: [f32; 4] = [0.15, 0.20, 0.28, 1.0]; // highlighted
-#[allow(dead_code)]
-const COLOR_TAB_ACTIVE_FG: [f32; 4] = [0.95, 0.95, 1.0, 1.0];
 const COLOR_TAB_ACCENT: [f32; 4] = [0.20, 0.65, 0.85, 1.0];  // cyan accent (active tab indicator)
-#[allow(dead_code)]
 const COLOR_TAB_SEPARATOR: [f32; 4] = [0.20, 0.20, 0.25, 1.0];
 const COLOR_STATUS_BG: [f32; 4] = [0.08, 0.08, 0.11, 1.0];
 const COLOR_STATUS_FG: [f32; 4] = [0.60, 0.60, 0.67, 1.0];
 const COLOR_BROADCAST_ALL: [f32; 4] = [0.90, 0.25, 0.25, 1.0]; // red
 const COLOR_BROADCAST_GROUP: [f32; 4] = [0.85, 0.40, 0.85, 1.0]; // magenta
+/// Selection highlight tint (matches the TUI backend's Rgb(60, 71, 100)).
+const COLOR_SELECTION_TINT: [f32; 4] = [60.0 / 255.0, 71.0 / 255.0, 100.0 / 255.0, 1.0];
 
 /// Per-cell instance data. Matches the `VertexInput` struct in the WGSL shader.
 ///
@@ -158,6 +154,9 @@ pub struct WgpuRenderer {
     event_loop: EventLoop<()>,
     /// Tracks keyboard modifier state (updated by ModifiersChanged events).
     mod_tracker: crate::ui::event::winit_translate::ModifierTracker,
+    /// Tracks mouse state (last cursor position, held button) so button
+    /// events can be translated into grid-cell coordinates.
+    mouse_tracker: crate::ui::event::winit_translate::MouseTracker,
     surface: wgpu::Surface<'static>,
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -167,10 +166,6 @@ pub struct WgpuRenderer {
     bind_group: wgpu::BindGroup,
     glyph_cache: GlyphCache,
     glyph_atlas_texture: wgpu::Texture,
-    #[allow(dead_code)]
-    glyph_atlas_view: wgpu::TextureView,
-    #[allow(dead_code)]
-    glyph_sampler: wgpu::Sampler,
     /// Tracks how many glyphs are currently in the atlas. If this changes
     /// between frames, we re-upload the texture.
     cached_glyph_count: usize,
@@ -436,6 +431,7 @@ impl WgpuRenderer {
             window,
             event_loop,
             mod_tracker: Default::default(),
+            mouse_tracker: Default::default(),
             surface,
             device,
             queue,
@@ -445,13 +441,45 @@ impl WgpuRenderer {
             bind_group,
             glyph_cache,
             glyph_atlas_texture,
-            glyph_atlas_view,
-            glyph_sampler,
             cached_glyph_count: 0,
             atlas_map: std::collections::HashMap::new(),
             pending_events: Vec::new(),
             start_time: std::time::Instant::now(),
         })
+    }
+
+    /// Build one glyph quad's placement (UV + offsets) for a cached glyph.
+    ///
+    /// Shared by the grid, tab bar, and status bar builders. Returns zeros
+    /// when the glyph isn't in the atlas yet (it will appear next frame).
+    fn glyph_rects(&mut self, ch: char, bold: bool, italic: bool) -> ([f32; 2], [f32; 2], [f32; 2], [f32; 2]) {
+        let g = self.glyph_cache.get(ch, bold, italic);
+        match self.atlas_map.get(&(ch, bold, italic)) {
+            Some(rect) if rect.w > 0 && rect.h > 0 => {
+                let baseline = CELL_HEIGHT as f32 - 3.0;
+                let gx = g.bearing_x.max(0.0);
+                let gy = (baseline + g.bearing_y).max(0.0);
+                (
+                    [
+                        rect.x as f32 / ATLAS_SIZE as f32,
+                        rect.y as f32 / ATLAS_SIZE as f32,
+                    ],
+                    [
+                        rect.w as f32 / ATLAS_SIZE as f32,
+                        rect.h as f32 / ATLAS_SIZE as f32,
+                    ],
+                    [gx, gy],
+                    [rect.w as f32, rect.h as f32],
+                )
+            }
+            _ => ([0.0, 0.0], [0.0, 0.0], [0.0, 0.0], [0.0, 0.0]),
+        }
+    }
+
+    /// Resolve the configured theme (or the default when unknown).
+    fn current_theme(app: &App) -> crate::theme::Theme {
+        crate::theme::resolve(&app.config.ui.theme, &app.config.custom_themes)
+            .unwrap_or_else(crate::theme::default_theme)
     }
 
     /// Build the full instance buffer for one frame: tab bar + terminal grid
@@ -462,6 +490,7 @@ impl WgpuRenderer {
     fn build_instances(&mut self, app: &App) -> Vec<CellInstance> {
         let manager = &app.manager;
         let active_idx = manager.active;
+        let theme = Self::current_theme(app);
 
         let cols = (self.config.width / CELL_WIDTH) as usize;
         let total_rows = (self.config.height / CELL_HEIGHT) as usize;
@@ -481,52 +510,70 @@ impl WgpuRenderer {
             let start_line = -(display_offset as i32);
             let render_rows = term_rows.min(screen_lines);
 
+            // Selection span per row (grid coordinates, like the TUI backend).
+            let selection = &app.session.selection;
+
+            // Block cursor position (viewport row), if visible.
+            let show_cursor = tab.term.mode().contains(alacritty_terminal::term::TermMode::SHOW_CURSOR);
+            let cursor_pos: Option<(usize, usize)> = show_cursor
+                .then(|| {
+                    let c = &grid.cursor.point;
+                    let row = c.line.0 + start_line; // grid Line → screen row
+                    let col = c.column.0;
+                    (row >= 0 && (row as usize) < render_rows && col < cols)
+                        .then_some((row as usize, col))
+                })
+                .flatten();
+
             for row_idx in 0..render_rows as i32 {
                 let line = ALine(start_line + row_idx);
+                let sel_span = if selection.is_active() {
+                    selection.line_span(line.0, cols)
+                } else {
+                    None
+                };
                 for col_idx in 0..cols {
                     let point = Point { line, column: Column(col_idx) };
                     let cell: &Cell = &grid[point];
 
-                    let bg = ansi_to_linear(cell.bg);
-                    let fg = ansi_to_linear(cell.fg);
+                    // The INVERSE cell flag means the renderer swaps fg/bg
+                    // (alacritty stores the flag, not the swap).
+                    let (mut fg, mut bg) = (
+                        ansi_to_linear(cell.fg, &theme),
+                        ansi_to_linear(cell.bg, &theme),
+                    );
+                    if cell.flags.contains(CellFlags::INVERSE) {
+                        std::mem::swap(&mut fg, &mut bg);
+                    }
+                    if cell.flags.contains(CellFlags::DIM) {
+                        fg = [fg[0] * 0.6, fg[1] * 0.6, fg[2] * 0.6, fg[3]];
+                    }
+
+                    // Selection highlight: replace the background with a
+                    // tint (inverse suppressed, matching the TUI backend).
+                    let selected = sel_span
+                        .map(|(a, b)| col_idx >= a && col_idx < b)
+                        .unwrap_or(false);
+                    if selected {
+                        bg = COLOR_SELECTION_TINT;
+                    }
+
+                    // Block cursor: reverse the cell.
+                    let is_cursor = cursor_pos
+                        .map(|(cr, cc)| cr == row_idx as usize && cc == col_idx)
+                        .unwrap_or(false);
+                    if is_cursor {
+                        std::mem::swap(&mut fg, &mut bg);
+                    }
 
                     let bold = cell.flags.contains(CellFlags::BOLD);
                     let italic = cell.flags.contains(CellFlags::ITALIC);
                     let has_glyph = cell.c != ' ' && cell.c != '\0';
 
-                    let mut flags = 0u32;
-                    if has_glyph {
-                        flags |= 1;
-                    }
-                    if bold {
-                        flags |= 2;
-                    }
-                    if italic {
-                        flags |= 4;
-                    }
+                    let flags = if has_glyph { 1u32 } else { 0u32 };
 
                     let (uv_offset, uv_size, glyph_offset, glyph_size) = if has_glyph {
-                        let g = self.glyph_cache.get(cell.c, bold, italic);
-                        match self.atlas_map.get(&(cell.c, bold, italic)) {
-                            Some(rect) if rect.w > 0 && rect.h > 0 => {
-                                let baseline = CELL_HEIGHT as f32 - 3.0;
-                                let gx = g.bearing_x.max(0.0);
-                                let gy = (baseline + g.bearing_y).max(0.0);
-                                (
-                                    [
-                                        rect.x as f32 / ATLAS_SIZE as f32,
-                                        rect.y as f32 / ATLAS_SIZE as f32,
-                                    ],
-                                    [
-                                        rect.w as f32 / ATLAS_SIZE as f32,
-                                        rect.h as f32 / ATLAS_SIZE as f32,
-                                    ],
-                                    [gx, gy],
-                                    [rect.w as f32, rect.h as f32],
-                                )
-                            }
-                            _ => ([0.0, 0.0], [0.0, 0.0], [0.0, 0.0], [0.0, 0.0]),
-                        }
+                        self.glyph_rects(cell.c, bold, italic)
                     } else {
                         ([0.0, 0.0], [0.0, 0.0], [0.0, 0.0], [0.0, 0.0])
                     };
@@ -599,37 +646,9 @@ impl WgpuRenderer {
                 }
 
                 let has_glyph = ch != ' ';
-                let mut flags = 0u32;
-                if has_glyph {
-                    flags |= 1;
-                }
-                if is_active {
-                    flags |= 2; // bold for active tab
-                }
-
+                let bold = is_active; // active tab is bold
                 let (uv_offset, uv_size, glyph_offset, glyph_size) = if has_glyph {
-                    let bold = is_active; // active tab is bold
-                    let g = self.glyph_cache.get(ch, bold, false);
-                    match self.atlas_map.get(&(ch, bold, false)) {
-                        Some(rect) if rect.w > 0 && rect.h > 0 => {
-                            let baseline = CELL_HEIGHT as f32 - 3.0;
-                            let gx = g.bearing_x.max(0.0);
-                            let gy = (baseline + g.bearing_y).max(0.0);
-                            (
-                                [
-                                    rect.x as f32 / ATLAS_SIZE as f32,
-                                    rect.y as f32 / ATLAS_SIZE as f32,
-                                ],
-                                [
-                                    rect.w as f32 / ATLAS_SIZE as f32,
-                                    rect.h as f32 / ATLAS_SIZE as f32,
-                                ],
-                                [gx, gy],
-                                [rect.w as f32, rect.h as f32],
-                            )
-                        }
-                        _ => ([0.0, 0.0], [0.0, 0.0], [0.0, 0.0], [0.0, 0.0]),
-                    }
+                    self.glyph_rects(ch, bold, false)
                 } else {
                     ([0.0, 0.0], [0.0, 0.0], [0.0, 0.0], [0.0, 0.0])
                 };
@@ -644,7 +663,7 @@ impl WgpuRenderer {
                     uv_size,
                     bg_color: bg,
                     fg_color: fg,
-                    flags,
+                    flags: if has_glyph { 1 } else { 0 },
                 };
                 col += 1;
             }
@@ -674,7 +693,8 @@ impl WgpuRenderer {
     fn build_status_bar_instances(&mut self, app: &App, cols: usize, total_rows: usize) -> Vec<CellInstance> {
         let manager = &app.manager;
         let active_idx = manager.active;
-        let y = (total_rows.saturating_sub(1) as u32 * CELL_HEIGHT) as f32;
+        // Bottom row: anchored to the window's bottom edge.
+        let y = ((total_rows * CELL_HEIGHT as usize).saturating_sub(STATUS_BAR_HEIGHT as usize)) as f32;
 
         // Build the status text.
         let (status_text, text_color) = match &manager.broadcast {
@@ -716,33 +736,8 @@ impl WgpuRenderer {
             }
 
             let has_glyph = ch != ' ';
-            let mut flags = 0u32;
-            if has_glyph {
-                flags |= 1;
-            }
-
             let (uv_offset, uv_size, glyph_offset, glyph_size) = if has_glyph {
-                let g = self.glyph_cache.get(ch, false, false);
-                match self.atlas_map.get(&(ch, false, false)) {
-                    Some(rect) if rect.w > 0 && rect.h > 0 => {
-                        let baseline = CELL_HEIGHT as f32 - 3.0;
-                        let gx = g.bearing_x.max(0.0);
-                        let gy = (baseline + g.bearing_y).max(0.0);
-                        (
-                            [
-                                rect.x as f32 / ATLAS_SIZE as f32,
-                                rect.y as f32 / ATLAS_SIZE as f32,
-                            ],
-                            [
-                                rect.w as f32 / ATLAS_SIZE as f32,
-                                rect.h as f32 / ATLAS_SIZE as f32,
-                            ],
-                            [gx, gy],
-                            [rect.w as f32, rect.h as f32],
-                        )
-                    }
-                    _ => ([0.0, 0.0], [0.0, 0.0], [0.0, 0.0], [0.0, 0.0]),
-                }
+                self.glyph_rects(ch, false, false)
             } else {
                 ([0.0, 0.0], [0.0, 0.0], [0.0, 0.0], [0.0, 0.0])
             };
@@ -756,7 +751,7 @@ impl WgpuRenderer {
                 uv_size,
                 bg_color: COLOR_STATUS_BG,
                 fg_color: text_color,
-                flags,
+                flags: if has_glyph { 1 } else { 0 },
             };
         }
 
@@ -770,10 +765,14 @@ impl WgpuRenderer {
     /// Uses a simple row-based shelf packing: glyphs are placed left-to-right
     /// in the current row; when a glyph won't fit, move to the next row.
     /// This is O(glyph_count) and only runs when the cache grows.
-    fn maybe_upload_atlas(&mut self) {
+    ///
+    /// Returns `true` when the atlas was rebuilt. Callers that build
+    /// instances BEFORE uploading must rebuild them afterwards — instances
+    /// built against the old (empty) atlas map render blank for a frame.
+    fn maybe_upload_atlas(&mut self) -> bool {
         let count = self.glyph_cache.len();
         if count == self.cached_glyph_count {
-            return;
+            return false;
         }
         self.cached_glyph_count = count;
 
@@ -862,6 +861,7 @@ impl WgpuRenderer {
                 depth_or_array_layers: 1,
             },
         );
+        true
     }
 }
 
@@ -872,15 +872,19 @@ impl Renderer for WgpuRenderer {
         // the first render() call may run before the surface is ready
         // (especially on Wayland), causing get_current_texture to fail.
         let mut tracker = self.mod_tracker;
+        let mut mouse = self.mouse_tracker;
+        let (cols, rows) = self.size();
         let _ = self.event_loop.pump_events(
             Some(std::time::Duration::from_millis(50)),
             |event, elwt| {
                 let _ = crate::ui::event::winit_translate::translate_event(
-                    &event, &mut tracker, elwt,
+                    &event, &mut tracker, &mut mouse, elwt,
+                    CELL_WIDTH, CELL_HEIGHT, cols, rows,
                 );
             },
         );
         self.mod_tracker = tracker;
+        self.mouse_tracker = mouse;
 
         // Now that the window has its initial size, configure the surface
         // to match. This avoids a wasted first frame.
@@ -916,17 +920,21 @@ impl Renderer for WgpuRenderer {
         // `self.pending_events` directly.
         let mut collected: Vec<crate::ui::event::AppEvent> = Vec::new();
         let mut tracker = self.mod_tracker;
+        let mut mouse = self.mouse_tracker;
+        let (cols, rows) = self.size();
         let timeout = Some(std::time::Duration::from_millis(timeout_ms));
 
         let status = self.event_loop.pump_events(timeout, |event, elwt| {
             if let Some(app_ev) = crate::ui::event::winit_translate::translate_event(
-                &event, &mut tracker, elwt,
+                &event, &mut tracker, &mut mouse, elwt,
+                CELL_WIDTH, CELL_HEIGHT, cols, rows,
             ) {
                 collected.push(app_ev);
             }
         });
 
         self.mod_tracker = tracker;
+        self.mouse_tracker = mouse;
 
         // If the event loop is exiting (window close button, etc.), signal quit.
         if let PumpStatus::Exit(_) = status {
@@ -966,11 +974,19 @@ impl Renderer for WgpuRenderer {
         };
         self.queue.write_buffer(&self.uniform_buffer, 0, bytemuck::cast_slice(&[uniforms]));
 
-        // Build instances for this frame.
-        let instances = self.build_instances(app);
+        // Build instances, then upload the atlas if this frame rasterized
+        // new glyphs, then REBUILD the instances so they carry the fresh UV
+        // rects — otherwise every first-seen character renders blank for a
+        // frame (its instance was built against the empty atlas map).
+        let mut instances = self.build_instances(app);
+        if self.maybe_upload_atlas() {
+            instances = self.build_instances(app);
+        }
 
-        // Maybe upload the atlas (only if new glyphs were rasterized).
-        self.maybe_upload_atlas();
+        // Resolve the theme for the window background (grid cells get it via
+        // the theme's Background color; this fills the margins).
+        let app_theme = crate::theme::resolve(&app.config.ui.theme, &app.config.custom_themes)
+            .unwrap_or_else(crate::theme::default_theme);
 
         // Create the instance buffer.
         let instance_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -1007,10 +1023,10 @@ impl Renderer for WgpuRenderer {
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: COLOR_BG[0] as f64,
-                            g: COLOR_BG[1] as f64,
-                            b: COLOR_BG[2] as f64,
-                            a: COLOR_BG[3] as f64,
+                            r: app_theme.bg.r as f64 / 255.0,
+                            g: app_theme.bg.g as f64 / 255.0,
+                            b: app_theme.bg.b as f64 / 255.0,
+                            a: 1.0,
                         }),
                         store: wgpu::StoreOp::Store,
                     },
@@ -1062,8 +1078,8 @@ impl BackendFactory for WgpuFactory {
 
 // ─── Color conversion ────────────────────────────────────────────────────────
 
-fn ansi_to_linear(c: AnsiColor) -> [f32; 4] {
-    let (r, g, b, a) = ansi_to_rgba_u8(c);
+fn ansi_to_linear(c: AnsiColor, theme: &crate::theme::Theme) -> [f32; 4] {
+    let (r, g, b, a) = ansi_to_rgba_u8(c, theme);
     [
         r as f32 / 255.0,
         g as f32 / 255.0,
@@ -1072,55 +1088,57 @@ fn ansi_to_linear(c: AnsiColor) -> [f32; 4] {
     ]
 }
 
-fn ansi_to_rgba_u8(c: AnsiColor) -> (u8, u8, u8, u8) {
+fn ansi_to_rgba_u8(c: AnsiColor, theme: &crate::theme::Theme) -> (u8, u8, u8, u8) {
     match c {
-        AnsiColor::Named(n) => named_to_rgba(n),
+        AnsiColor::Named(n) => named_to_rgba(n, theme),
         AnsiColor::Spec(rgb) => (rgb.r, rgb.g, rgb.b, 255),
-        AnsiColor::Indexed(i) => match i {
-            0 => (0, 0, 0, 255),
-            1 => (205, 0, 0, 255),
-            2 => (0, 205, 0, 255),
-            3 => (205, 205, 0, 255),
-            4 => (0, 0, 238, 255),
-            5 => (205, 0, 205, 255),
-            6 => (0, 205, 205, 255),
-            7 => (229, 229, 229, 255),
-            8 => (127, 127, 127, 255),
-            9 => (255, 0, 0, 255),
-            10 => (0, 255, 0, 255),
-            11 => (255, 255, 0, 255),
-            12 => (92, 92, 255, 255),
-            13 => (255, 0, 255, 255),
-            14 => (0, 255, 255, 255),
-            15 => (255, 255, 255, 255),
-            _ => (200, 200, 200, 255),
-        },
+        AnsiColor::Indexed(i) => {
+            // First 16 indices come from the theme; 216-cube + grayscale are
+            // fixed hardware palettes.
+            if i < 16 {
+                let t = theme.ansi(i);
+                (t.r, t.g, t.b, 255)
+            } else if (16..232).contains(&i) {
+                let j = i - 16;
+                let r = (j / 36) % 6;
+                let g = (j / 6) % 6;
+                let b = j % 6;
+                let to_byte = |v: u8| if v == 0 { 0 } else { 55 + v * 40 };
+                (to_byte(r), to_byte(g), to_byte(b), 255)
+            } else {
+                let v = 8 + (i - 232) * 10;
+                (v, v, v, 255)
+            }
+        }
     }
 }
 
-fn named_to_rgba(n: NamedColor) -> (u8, u8, u8, u8) {
+fn named_to_rgba(n: NamedColor, theme: &crate::theme::Theme) -> (u8, u8, u8, u8) {
+    let rgb = |c: crate::theme::Color| (c.r, c.g, c.b, 255u8);
     use NamedColor::*;
     match n {
-        Black => (0, 0, 0, 255),
-        Red => (205, 0, 0, 255),
-        Green => (0, 205, 0, 255),
-        Yellow => (205, 205, 0, 255),
-        Blue => (0, 0, 238, 255),
-        Magenta => (205, 0, 205, 255),
-        Cyan => (0, 205, 205, 255),
-        White => (229, 229, 229, 255),
-        BrightBlack => (127, 127, 127, 255),
-        BrightRed => (255, 0, 0, 255),
-        BrightGreen => (0, 255, 0, 255),
-        BrightYellow => (255, 255, 0, 255),
-        BrightBlue => (92, 92, 255, 255),
-        BrightMagenta => (255, 0, 255, 255),
-        BrightCyan => (0, 255, 255, 255),
-        BrightWhite => (255, 255, 255, 255),
-        BrightForeground => (255, 255, 255, 255),
-        Foreground => (229, 229, 229, 255),
-        Background => (5, 10, 5, 255),
-        Cursor => (255, 255, 255, 255),
+        Black => rgb(theme.black),
+        Red => rgb(theme.red),
+        Green => rgb(theme.green),
+        Yellow => rgb(theme.yellow),
+        Blue => rgb(theme.blue),
+        Magenta => rgb(theme.magenta),
+        Cyan => rgb(theme.cyan),
+        White => rgb(theme.white),
+        BrightBlack => rgb(theme.bright_black),
+        BrightRed => rgb(theme.bright_red),
+        BrightGreen => rgb(theme.bright_green),
+        BrightYellow => rgb(theme.bright_yellow),
+        BrightBlue => rgb(theme.bright_blue),
+        BrightMagenta => rgb(theme.bright_magenta),
+        BrightCyan => rgb(theme.bright_cyan),
+        BrightWhite => rgb(theme.bright_white),
+        BrightForeground => rgb(theme.fg),
+        Foreground => rgb(theme.fg),
+        Background => rgb(theme.bg),
+        Cursor => rgb(theme.cursor),
+        // Dim* variants map to their base color (dimming is applied by the
+        // fg scale in build_instances).
         _ => (200, 200, 200, 255),
     }
 }

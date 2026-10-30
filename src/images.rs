@@ -43,10 +43,7 @@
 //! quads. Proper aspect-ratio preservation and scrolling are deferred.
 
 use std::collections::HashMap;
-use std::io::Cursor;
 use std::sync::Mutex;
-
-use image::ImageDecoder;
 
 /// A decoded inline image.
 #[derive(Debug, Clone)]
@@ -70,6 +67,11 @@ pub struct InlineImage {
 impl InlineImage {
     /// Decode an image from raw bytes (PNG, JPEG, GIF, etc.) and compute
     /// the cell footprint based on the given cell dimensions.
+    ///
+    /// The decode goes through `DynamicImage` so every native layout
+    /// (RGB JPEG, 16-bit/grayscale/palette PNG, …) is converted to RGBA8 —
+    /// reading a decoder's native buffer directly into an RGBA-sized
+    /// allocation silently corrupts anything that isn't 4 bytes per pixel.
     pub fn from_bytes(
         bytes: &[u8],
         start_col: u32,
@@ -77,45 +79,15 @@ impl InlineImage {
         cell_w_px: u32,
         cell_h_px: u32,
     ) -> Result<Self, ImageError> {
-        let format = image::guess_format(bytes).map_err(ImageError::Format)?;
-        let cursor = Cursor::new(bytes);
-        let decoder: Box<dyn ImageDecoder> = match format {
-            image::ImageFormat::Png => Box::new(
-                image::codecs::png::PngDecoder::new(cursor).map_err(ImageError::Decode)?,
-            ),
-            image::ImageFormat::Jpeg => Box::new(
-                image::codecs::jpeg::JpegDecoder::new(cursor).map_err(ImageError::Decode)?,
-            ),
-            image::ImageFormat::Gif => Box::new(
-                image::codecs::gif::GifDecoder::new(cursor).map_err(ImageError::Decode)?,
-            ),
-            image::ImageFormat::WebP => Box::new(
-                image::codecs::webp::WebPDecoder::new(cursor).map_err(ImageError::Decode)?,
-            ),
-            image::ImageFormat::Bmp => Box::new(
-                image::codecs::bmp::BmpDecoder::new(cursor).map_err(ImageError::Decode)?,
-            ),
-            _ => {
-                return Err(ImageError::Unsupported(format!(
-                    "unsupported image format: {format:?}"
-                )))
-            }
-        };
-        let (w, h) = decoder.dimensions();
-        let buf_size = (w as usize)
-            .checked_mul(h as usize)
-            .and_then(|s| s.checked_mul(4))
-            .ok_or_else(|| ImageError::InvalidArgs("image dimensions too large".into()))?;
-        let mut pixels = vec![0u8; buf_size];
-        decoder
-            .read_image(&mut pixels)
-            .map_err(ImageError::Decode)?;
+        let img = image::load_from_memory(bytes).map_err(ImageError::Decode)?;
+        let rgba = img.to_rgba8();
+        let (w, h) = rgba.dimensions();
 
-        let cell_width = w.div_ceil(cell_w_px);
-        let cell_height = h.div_ceil(cell_h_px);
+        let cell_width = w.div_ceil(cell_w_px.max(1));
+        let cell_height = h.div_ceil(cell_h_px.max(1));
 
         Ok(Self {
-            pixels,
+            pixels: rgba.into_raw(),
             width: w,
             height: h,
             start_col,

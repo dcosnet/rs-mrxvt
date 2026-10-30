@@ -85,6 +85,46 @@ pub struct CommandEntry {
 }
 
 impl Command {
+    /// Parse a macro-spec string into a [`Command`].
+    ///
+    /// Bare variant names (`"ResetTerminal"`, `"Quit"`, …) cover the
+    /// parameterless commands; parameterized variants take the argument
+    /// after a colon (`"NewTabProfile:zsh"`, `"ToggleBroadcastGroup:web"`,
+    /// `"TagActiveTab:web"`, `"GotoTab:3"`). This is what turns the
+    /// config `[macros]` table into real keybindings.
+    pub fn parse_spec(spec: &str) -> Option<Command> {
+        let (head, arg) = match spec.split_once(':') {
+            Some((h, a)) => (h.trim(), Some(a.trim())),
+            None => (spec.trim(), None),
+        };
+        // Parameterized variants consume the colon argument; parameterless
+        // ones reject it so a stray `"Quit:"` isn't silently accepted.
+        match (head, arg) {
+            ("GotoTab", Some(a)) => Some(Command::GotoTab(a.parse().ok()?)),
+            ("NewTabProfile", Some(a)) => Some(Command::NewTabProfile(a.to_string())),
+            ("ToggleBroadcastGroup", Some(a)) => Some(Command::ToggleBroadcastGroup(a.to_string())),
+            ("TagActiveTab", Some(a)) => Some(Command::TagActiveTab(a.to_string())),
+            ("NewTab", None) => Some(Command::NewTab),
+            ("CloseTab", None) => Some(Command::CloseTab),
+            ("NextTab", None) => Some(Command::NextTab),
+            ("PrevTab", None) => Some(Command::PrevTab),
+            ("ToggleBroadcastAll", None) => Some(Command::ToggleBroadcastAll),
+            ("CopySelection", None) => Some(Command::CopySelection),
+            ("PasteClipboard", None) => Some(Command::PasteClipboard),
+            ("PastePrimary", None) => Some(Command::PastePrimary),
+            ("ScrollLineUp", None) => Some(Command::ScrollLineUp),
+            ("ScrollLineDown", None) => Some(Command::ScrollLineDown),
+            ("ScrollPageUp", None) => Some(Command::ScrollPageUp),
+            ("ScrollPageDown", None) => Some(Command::ScrollPageDown),
+            ("ScrollToTop", None) => Some(Command::ScrollToTop),
+            ("ScrollToBottom", None) => Some(Command::ScrollToBottom),
+            ("OpenPalette", None) => Some(Command::OpenPalette),
+            ("ResetTerminal", None) => Some(Command::ResetTerminal),
+            ("Quit", None) => Some(Command::Quit),
+            _ => None,
+        }
+    }
+
     /// The default, parameterless commands shown in the palette.
     pub fn defaults() -> Vec<CommandEntry> {
         vec![

@@ -168,12 +168,18 @@ Three implementations exist today:
 | Backend       | File          | Feature | Status      |
 |---------------|---------------|---------|-------------|
 | TuiRenderer   | `ui/tui.rs`   | default | ✅ working  |
-| WgpuRenderer  | `ui/wgpu.rs`  | `gpu`   | 🚧 scaffold |
-| SoftRenderer  | `ui/soft.rs`  | `gpu`   | 🚧 scaffold |
+| WgpuRenderer  | `ui/wgpu.rs`  | `gpu`   | ✅ working  |
+| SoftRenderer  | `ui/soft.rs`  | `gpu`   | ✅ working  |
 | MockRenderer  | `ui/mock.rs`  | default | ✅ for tests |
 
-The scaffolds compile and open windows but only render a solid background
-color. The glyph atlas + text rendering pipeline is the next phase.
+All three real backends render the full grid (text, colors, cursor,
+selection highlight, tab bar, status bar) and accept mouse input
+(selection, SGR reporting to the child, wheel scrollback). Remaining
+backend gaps, in rough priority order: the command palette overlay is
+only drawn by the TUI backend, inline images and hyperlink underlines
+aren't composited by any backend yet, and bold/italic rasterization
+falls back to the regular glyph (`GlyphCache::rasterize` ignores the
+style flags).
 
 ## 7. Backend selection — `BackendRegistry`
 
@@ -308,13 +314,14 @@ reaches the child, `PtySession::spawn` logs a one-time warning.
 
 ## 12. Testing strategy
 
-- **Unit tests** (`cargo test --lib`): 200+ tests covering input routing,
+- **Unit tests** (`cargo test --lib`): 280+ tests covering input routing,
   config parsing, tab manager state transitions, palette filtering,
   keybinding resolution, key-to-bytes translation, event abstraction,
   backend selection logic, app event handling, clipboard (base64/OSC 52,
   paste sanitation, mock round-trips), selection (line spans, word/line
   kinds, text extraction over real PTYs), scrollback, mouse-mode
-  bridging, OSC 52/title event forwarding, and login-shell spawning.
+  bridging (including SGR motion encoding), OSC 52/title event
+  forwarding, and login-shell spawning.
 - **Integration tests** (`tests/integration.rs`): 10 end-to-end tests
   spawning real subprocesses via PTY and verifying the alacritty_terminal
   emulator renders the output.
@@ -324,7 +331,7 @@ reaches the child, `PtySession::spawn` logs a one-time warning.
   spawns N PTYs (default 50), broadcasts a marker, and verifies all N
   received it within the timeout.
 
-Total: 220+ Rust tests + 1 Python harness, all passing. The same suite
+Total: 300+ Rust tests + 1 Python harness, all passing. The same suite
 passes with `--features gpu`, `--features lua`, `--features images`, and
 combinations thereof.
 

@@ -356,8 +356,19 @@ impl ClipboardBackend for SystemClipboard {
         match self.tool_store(kind, text) {
             Ok(()) => Ok(()),
             Err(e) => {
-                log::debug!("clipboard tool store failed: {e}");
-                Ok(()) // OSC 52 already delivered the copy.
+                // A tool failure is only tolerable when OSC 52 actually
+                // delivered the copy to the host terminal. When OSC 52 is
+                // disabled (or the payload exceeded its cap), nothing was
+                // delivered anywhere — surface the failure so the UI can
+                // say "Copy failed" instead of lying with "Copied N chars".
+                let delivered_by_osc52 =
+                    self.osc52 && self.osc52_enabled && text.len() <= OSC52_MAX_BYTES;
+                if delivered_by_osc52 {
+                    log::debug!("clipboard tool store failed (OSC 52 delivered instead): {e}");
+                    Ok(())
+                } else {
+                    Err(anyhow::anyhow!("clipboard tool failed and OSC 52 disabled: {e}"))
+                }
             }
         }
     }
@@ -463,8 +474,10 @@ pub fn base64_encode(data: &[u8]) -> String {
 ///   as decoded chars they can) are stripped for the same reason.
 /// - `\r\n` and lone `\r` are normalized to `\n` — shells treat a raw `\r`
 ///   as a cursor return, which corrupts the command line.
-/// - Trailing whitespace is trimmed so a trailing newline doesn't fire the
-///   command immediately (matching what users expect from "paste").
+/// - ONE trailing `\n` is dropped (together with the spaces/tabs directly
+///   before it) so a paste doesn't auto-submit the command. Whitespace
+///   *without* a trailing newline is preserved — trailing spaces in pasted
+///   code are legitimate content.
 pub fn sanitize_paste(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut chars = text.chars().peekable();
@@ -483,8 +496,11 @@ pub fn sanitize_paste(text: &str) -> String {
         }
     }
     // Drop ONE trailing newline so paste doesn't auto-submit; keep the rest.
-    let trimmed = out.trim_end_matches([' ', '\t']);
-    trimmed.strip_suffix('\n').map(|s| s.to_string()).unwrap_or_else(|| trimmed.to_string())
+    // Only the whitespace immediately before that newline is trimmed.
+    match out.strip_suffix('\n') {
+        Some(body) => body.trim_end_matches([' ', '\t']).to_string(),
+        None => out,
+    }
 }
 
 /// Wrap text in bracketed-paste markers (`ESC[200~ … ESC[201~`).
@@ -545,6 +561,23 @@ mod tests {
     #[test]
     fn sanitize_keeps_tabs_and_interior_newlines() {
         assert_eq!(sanitize_paste("a\tb\nc"), "a\tb\nc");
+    }
+
+    #[test]
+    fn sanitize_keeps_trailing_whitespace_without_newline() {
+        // Regression: trailing spaces/tabs used to be stripped even when
+        // there was no trailing newline — deleting legitimate content.
+        assert_eq!(sanitize_paste("foo "), "foo ");
+        assert_eq!(sanitize_paste("let x = 1;   "), "let x = 1;   ");
+        assert_eq!(sanitize_paste("indent\t"), "indent\t");
+    }
+
+    #[test]
+    fn sanitize_trims_whitespace_before_dropped_newline() {
+        // "cmd \n" should not leave a stray trailing space behind.
+        assert_eq!(sanitize_paste("cmd \n"), "cmd");
+        assert_eq!(sanitize_paste("cmd\t\n"), "cmd");
+        assert_eq!(sanitize_paste("cmd \n\n"), "cmd \n");
     }
 
     #[test]

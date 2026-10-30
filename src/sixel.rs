@@ -35,10 +35,9 @@
 //! - `q` is the Sixel command introducer
 //! - `<params>` are semicolon-separated `key=val` pairs
 //! - `<sixel-data>` is a mix of:
-//!   - `?` repeat count (e.g. `!10?` = repeat 10 times)
 //!   - `#` color register selection (e.g. `#0` = use color 0)
 //!   - `#N;r;g;b` define color N as r,g,b (0..100)
-//!   - `!N<char>` repeat character N times
+//!   - `!N<char>` repeat char N times (e.g. `!10?` = ten `?` sixels)
 //!   - `$` carriage return (move to start of current line)
 //!   - `-` new line of sixels
 //!   - chars `?` (0x3f, 0b000000) to `~` (0x7e, 0b111111): 6 pixels high
@@ -70,8 +69,8 @@ pub fn parse_sixel(
     parser.feed(data)?;
     let (pixels, w, h) = parser.finalize();
 
-    let cell_width = w.div_ceil(cell_w_px);
-    let cell_height = h.div_ceil(cell_h_px);
+    let cell_width = w.div_ceil(cell_w_px.max(1));
+    let cell_height = h.div_ceil(cell_h_px.max(1));
 
     Ok(InlineImage {
         pixels,
@@ -93,9 +92,14 @@ struct ColorReg {
 }
 
 /// Sixel parser state machine.
+///
+/// Pixels are collected sparsely and packed row-major only at `finalize` —
+/// the image width grows as columns arrive, and repacking an existing
+/// row-major buffer on every width change is where stride corruption
+/// (sheared/garbled output) comes from.
 struct SixelParser {
-    /// The output pixel buffer in row-major RGBA order.
-    pixels: Vec<u8>,
+    /// Painted pixels keyed by (x, y).
+    painted: std::collections::HashMap<(u32, u32), ColorReg>,
     /// Width in pixels (grows as we see more sixels in a row).
     width: u32,
     /// Height in pixels (grows as we see more rows).
@@ -127,7 +131,7 @@ enum SixelState {
 impl SixelParser {
     fn new() -> Self {
         Self {
-            pixels: Vec::new(),
+            painted: std::collections::HashMap::new(),
             width: 0,
             height: 0,
             x: 0,
@@ -171,21 +175,14 @@ impl SixelParser {
             '-' => {
                 self.x = 0;
                 self.y_base += 6;
-                let new_h = self.y_base + 6;
-                if new_h > self.height {
-                    self.height = new_h;
-                    self.grow_buffer();
-                }
+                self.height = self.height.max(self.y_base + 6);
             }
             // Sixel character: 6 pixels tall, encoded as ?..~ (0x3f..0x7e).
             '?'..='~' => {
                 let sixel = (c as u8) - 0x3f; // 0b000000..0b111111
                 self.draw_sixel(sixel);
                 self.x += 1;
-                if self.x > self.width {
-                    self.width = self.x;
-                    self.grow_buffer();
-                }
+                self.width = self.width.max(self.x);
             }
             // Whitespace and unknown chars are ignored.
             _ => {}
@@ -238,10 +235,7 @@ impl SixelParser {
             for _ in 0..count {
                 self.draw_sixel(sixel);
                 self.x += 1;
-                if self.x > self.width {
-                    self.width = self.x;
-                    self.grow_buffer();
-                }
+                self.width = self.width.max(self.x);
             }
         }
         // Other chars: ignore (the spec says the char after !N must be a sixel).
@@ -261,40 +255,24 @@ impl SixelParser {
         }
     }
 
-    /// Set a single pixel, growing the buffer if necessary.
+    /// Record one painted pixel; the row-major buffer is packed at finalize.
     fn set_pixel(&mut self, x: u32, y: u32, color: ColorReg) {
-        // Grow height if needed.
-        let needed_h = y + 1;
-        if needed_h > self.height {
-            self.height = needed_h;
-            self.grow_buffer();
-        }
-        // Grow width if needed.
-        let needed_w = x + 1;
-        if needed_w > self.width {
-            self.width = needed_w;
-            self.grow_buffer();
-        }
-        let idx = ((y * self.width + x) * 4) as usize;
-        if idx + 3 < self.pixels.len() {
-            self.pixels[idx] = color.r;
-            self.pixels[idx + 1] = color.g;
-            self.pixels[idx + 2] = color.b;
-            self.pixels[idx + 3] = 255;
-        }
+        self.painted.insert((x, y), color);
+        self.width = self.width.max(x + 1);
+        self.height = self.height.max(y + 1);
     }
 
-    /// Resize the pixel buffer to match current width/height.
-    fn grow_buffer(&mut self) {
-        let new_size = (self.width * self.height * 4) as usize;
-        if self.pixels.len() < new_size {
-            self.pixels.resize(new_size, 0);
-        }
-    }
-
-    /// Finalize: return (pixels, width, height).
+    /// Pack the painted pixels into a row-major RGBA buffer.
     fn finalize(self) -> (Vec<u8>, u32, u32) {
-        (self.pixels, self.width, self.height)
+        let mut pixels = vec![0u8; (self.width as usize) * (self.height as usize) * 4];
+        for ((x, y), c) in &self.painted {
+            let idx = ((y * self.width + x) * 4) as usize;
+            pixels[idx] = c.r;
+            pixels[idx + 1] = c.g;
+            pixels[idx + 2] = c.b;
+            pixels[idx + 3] = 255;
+        }
+        (pixels, self.width, self.height)
     }
 }
 
@@ -394,5 +372,32 @@ mod tests {
         let img = parse_sixel(b"~", 5, 3, 8, 16).unwrap();
         assert_eq!(img.start_col, 5);
         assert_eq!(img.start_row, 3);
+    }
+
+    #[test]
+    fn width_growth_does_not_shear_earlier_pixels() {
+        // Regression: the old incremental buffer never re-packed rows when
+        // the width grew, so pixel (0,1) was reinterpreted as (1,0).
+        // Column 0 red, then column 1 green:
+        let data = b"#0;100;0;0~#1;0;100;0~";
+        let img = parse_sixel(data, 0, 0, 8, 16).unwrap();
+        assert_eq!(img.width, 2);
+        assert_eq!(img.height, 6);
+        let px = |x: u32, y: u32| -> (u8, u8, u8, u8) {
+            let i = ((y * img.width + x) * 4) as usize;
+            (img.pixels[i], img.pixels[i + 1], img.pixels[i + 2], img.pixels[i + 3])
+        };
+        // Column 0 stays red, column 1 green — no bleed-through either way.
+        assert_eq!(px(0, 0), (255, 0, 0, 255));
+        assert_eq!(px(0, 1), (255, 0, 0, 255), "(0,1) must keep column 0's color");
+        assert_eq!(px(1, 0), (0, 255, 0, 255));
+        assert_eq!(px(1, 5), (0, 255, 0, 255));
+    }
+
+    #[test]
+    fn zero_cell_size_does_not_panic() {
+        let img = parse_sixel(b"~", 0, 0, 0, 0).unwrap();
+        assert_eq!(img.cell_width, 1);
+        assert_eq!(img.cell_height, 6);
     }
 }

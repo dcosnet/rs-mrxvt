@@ -41,6 +41,7 @@ use crate::cli::Cli;
 use crate::clipboard::{bracket, sanitize_paste, ClipboardBackend, ClipboardKind, SystemClipboard};
 use crate::command::Command;
 use crate::config::Config;
+use crate::config_watch::ConfigWatcher;
 use crate::input::router::{InputAction, InputRouter};
 use crate::input::bindings::KeyBindingTable;
 use crate::mouse::{MouseButton, MouseEvent, MouseEventKind, SelPoint};
@@ -74,6 +75,15 @@ pub struct App {
     pub clipboard: Box<dyn ClipboardBackend>,
     /// Transient status-bar message, if any.
     pub notice: Option<Notice>,
+    /// Last (cols, rows) the tabs were resized to, so per-tick size checks
+    /// only resizes on an actual change. `None` until the first frame.
+    last_grid_size: Option<(u16, u16)>,
+    /// Last observed alternate-screen state of the active tab. A transition
+    /// (e.g. vim/less entering or leaving the alt screen) invalidates the
+    /// selection, which lives in the primary grid's coordinates.
+    watched_alt_screen: Option<bool>,
+    /// Config hot-reload watcher, when one was started. Polled every tick.
+    config_watcher: Option<ConfigWatcher>,
 }
 
 impl App {
@@ -89,7 +99,8 @@ impl App {
         config: Config,
         clipboard: Box<dyn ClipboardBackend>,
     ) -> anyhow::Result<Self> {
-        let bindings = KeyBindingTable::defaults();
+        let mut bindings = KeyBindingTable::defaults();
+        bindings.apply_macros(&config.macros);
         let router = InputRouter::new(bindings);
 
         let mut manager = TerminalManager::new(&config);
@@ -142,6 +153,9 @@ impl App {
             quit: false,
             clipboard,
             notice: None,
+            last_grid_size: None,
+            watched_alt_screen: None,
+            config_watcher: None,
         })
     }
 
@@ -224,7 +238,11 @@ impl App {
     pub fn run_command(&mut self, cmd: &Command, cols: u16, rows: u16) -> InputAction {
         match cmd {
             Command::OpenPalette => {
-                self.palette.toggle();
+                if self.config.ui.disable_palette {
+                    self.notify("Command palette is disabled (ui.disable_palette)");
+                } else {
+                    self.palette.toggle();
+                }
                 InputAction::Handled
             }
             Command::Quit => {
@@ -270,9 +288,10 @@ impl App {
         match ev {
             AppEvent::Key(k) => self.handle_app_key(k, cols, rows),
             AppEvent::Resize(_c, _r) => {
-                // The renderer reports its own size via `Renderer::size()`,
-                // which is called by the main loop. Nothing to do here beyond
-                // acknowledging the event.
+                // The main loop compares `Renderer::size()` every tick and
+                // calls `manager.resize_all` on an actual change, so the PTY
+                // winsize and grid stay in sync with the window. Nothing to
+                // do here beyond acknowledging the event.
                 InputAction::Continue
             }
             AppEvent::FocusGained | AppEvent::FocusLost => InputAction::Continue,
@@ -527,12 +546,7 @@ impl App {
         // (The router's internals still use crossterm types; we bridge here.)
         let ck = app_key_to_crossterm(ev);
         let action = self.router.handle(ck, &mut self.manager, &self.config, cols, rows);
-        // The router returns `OpenPalette` as a signal; act on it here by
-        // actually opening the palette. (The router doesn't touch UI state.)
-        if matches!(action, InputAction::OpenPalette) {
-            self.palette.open();
-        }
-        action
+        self.absorb_router_action(action, cols, rows)
     }
 
     /// Handle a crossterm `KeyEvent` directly. Kept for backward compat
@@ -544,10 +558,26 @@ impl App {
         }
 
         let action = self.router.handle(ev, &mut self.manager, &self.config, cols, rows);
-        if matches!(action, InputAction::OpenPalette) {
-            self.palette.open();
+        self.absorb_router_action(action, cols, rows)
+    }
+
+    /// Act on the router's recommendation: open the palette or run a command
+    /// the router can't execute itself (clipboard commands need the App's
+    /// clipboard backend and session selection).
+    fn absorb_router_action(&mut self, action: InputAction, cols: u16, rows: u16) -> InputAction {
+        match action {
+            InputAction::OpenPalette => {
+                if self.config.ui.disable_palette {
+                    self.notify("Command palette is disabled (ui.disable_palette)");
+                    InputAction::Handled
+                } else {
+                    self.palette.open();
+                    InputAction::OpenPalette
+                }
+            }
+            InputAction::Command(cmd) => self.run_command(&cmd, cols, rows),
+            other => other,
         }
-        action
     }
 
     fn handle_palette_key(&mut self, ev: KeyEvent, cols: u16, rows: u16) -> InputAction {
@@ -645,6 +675,24 @@ impl App {
         }
     }
 
+    /// Start polling the config file for changes (hot reload). The watcher
+    /// re-loads it on save and delivers updates into the main loop every
+    /// tick. Call before `run`; a failed spawn just disables hot reload.
+    pub fn start_config_watcher(&mut self, interval_ms: u64) -> anyhow::Result<()> {
+        let path = self
+            .cli
+            .config
+            .clone()
+            .unwrap_or_else(Config::default_path);
+        let watcher = ConfigWatcher::spawn(path, interval_ms)?;
+        // Swallow the watcher's initial delivery: the app already loaded the
+        // same file at startup (possibly through CLI overrides the watcher
+        // can't reproduce), so re-applying it would be a no-op at best.
+        while watcher.try_recv().is_some() {}
+        self.config_watcher = Some(watcher);
+        Ok(())
+    }
+
     /// Run the main loop with a given renderer. Returns process exit code.
     ///
     /// Accepts a `Box<dyn Renderer>` so the caller can pick the backend at
@@ -655,9 +703,13 @@ impl App {
         // Initial resize to actual terminal dimensions.
         let (cols, rows) = renderer.size();
         self.manager.resize_all(cols, rows);
+        self.last_grid_size = Some((cols, rows));
 
         let result = self.main_loop(&mut *renderer);
 
+        if let Some(mut watcher) = self.config_watcher.take() {
+            watcher.stop();
+        }
         renderer.fini()?;
         result.map(|_| 0)
     }
@@ -665,8 +717,23 @@ impl App {
     fn main_loop(&mut self, renderer: &mut dyn crate::ui::Renderer) -> anyhow::Result<()> {
         let poll_ms = 50; // 20 Hz input poll; PTY drain is per-tick.
         while !self.quit {
+            // 0. Pick up config changes from disk (hot reload), then apply
+            //    any window resize. Resizing before draining PTYs matters:
+            //    the render pass indexes the grid with the renderer's size,
+            //    so a stale grid would panic the moment the window grows.
+            self.apply_reloaded_config();
+            let (cols, rows) = renderer.size();
+            if self.last_grid_size != Some((cols, rows)) {
+                self.manager.resize_all(cols, rows);
+                self.last_grid_size = Some((cols, rows));
+                // A resize reflows the grid; selection coordinates recorded
+                // against the old layout no longer match the content.
+                self.session.selection.clear();
+            }
+            self.invalidate_selection_on_alt_screen_change();
+
             // 1. Drain PTYs, then act on VT events (titles, OSC 52, bells).
-            let (_active_changed, _any_eof) = self.manager.poll_all();
+            let _poll = self.manager.poll_all();
             let events = self.manager.drain_events();
             if !events.is_empty() {
                 self.handle_tab_events(events);
@@ -694,6 +761,38 @@ impl App {
             renderer.render(self)?;
         }
         Ok(())
+    }
+
+    /// Apply config delivered by the hot-reload watcher, if any.
+    fn apply_reloaded_config(&mut self) {
+        let Some(watcher) = self.config_watcher.as_ref() else {
+            return;
+        };
+        let mut newest: Option<Config> = None;
+        while let Some(cfg) = watcher.try_recv() {
+            newest = Some(cfg);
+        }
+        if let Some(cfg) = newest {
+            log::info!("hot-reload: applying updated config");
+            self.config = cfg;
+        }
+    }
+
+    /// Clear the selection when the active tab swaps screens. Selection
+    /// coordinates are grid lines on the *primary* screen; after vim/less
+    /// enters or leaves the alternate screen they would highlight (and copy)
+    /// unrelated cells.
+    fn invalidate_selection_on_alt_screen_change(&mut self) {
+        let alt = self
+            .manager
+            .active_tab()
+            .map(|t| t.alternate_screen())
+            .unwrap_or(false);
+        match self.watched_alt_screen {
+            Some(prev) if prev != alt => self.session.selection.clear(),
+            _ => {}
+        }
+        self.watched_alt_screen = Some(alt);
     }
 }
 
@@ -1153,5 +1252,123 @@ mod tests {
         let mut app = mock_app();
         app.run_command(&Command::CopySelection, 40, 10);
         assert_eq!(app.active_notice(), Some("No selection"));
+    }
+
+    #[test]
+    fn copy_chord_reaches_app_layer() {
+        // Regression for the dispatch gap: Ctrl+Shift+C used to be executed
+        // via manager.execute (which ignores clipboard commands) and vanish.
+        // It must come back as InputAction::Command and run through the app's
+        // clipboard path.
+        let mut app = mock_app();
+        let ev = crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('C'),
+            crossterm::event::KeyModifiers::CONTROL | crossterm::event::KeyModifiers::SHIFT,
+        );
+        let action = app.handle_key(ev, 40, 10);
+        assert_eq!(action, InputAction::Handled, "copy ran through run_command");
+        assert_eq!(app.active_notice(), Some("No selection"));
+    }
+
+    #[test]
+    fn paste_chord_reaches_app_layer_and_pastes() {
+        let mut app = mock_app();
+        run_interactive_child(&mut app, "cat", "MARKPASTE");
+        app.clipboard = Box::new(MockClipboard::with_content(
+            crate::clipboard::ClipboardKind::Clipboard,
+            "via-chord",
+        ));
+        let ev = crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('V'),
+            crossterm::event::KeyModifiers::CONTROL | crossterm::event::KeyModifiers::SHIFT,
+        );
+        let action = app.handle_key(ev, 40, 10);
+        assert_eq!(action, InputAction::Handled);
+        wait_grid(&mut app, "via-chord");
+        assert!(app.active_notice().unwrap().contains("Pasted"));
+    }
+
+    #[test]
+    fn disable_palette_config_blocks_opening() {
+        let cli = default_cli();
+        let mut cfg = Config::default();
+        cfg.ui.disable_palette = true;
+        let mut app = App::with_clipboard(cli, cfg, Box::new(MockClipboard::new())).unwrap();
+        app.run_command(&Command::OpenPalette, 40, 10);
+        assert!(!app.palette.is_open(), "ui.disable_palette must keep the palette closed");
+        assert!(app.active_notice().unwrap().contains("disabled"));
+    }
+
+    #[test]
+    fn config_macros_resolve_at_startup() {
+        let cli = Cli::try_parse_from(["rs-mrxvt"]).unwrap();
+        let mut cfg = Config::default();
+        cfg.macros.insert("Ctrl+Shift+Y".into(), "ResetTerminal".into());
+        let app = App::with_clipboard(cli, cfg, Box::new(MockClipboard::new())).unwrap();
+        let ev = crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('y'),
+            crossterm::event::KeyModifiers::CONTROL | crossterm::event::KeyModifiers::SHIFT,
+        );
+        // Must be a bound command, not passthrough bytes.
+        let resolved = app.router.bindings.resolve(ev);
+        assert_eq!(resolved, Some(Command::ResetTerminal));
+    }
+
+    #[test]
+    fn resize_event_updates_tab_size() {
+        // The main loop calls resize_all when the renderer's size changes;
+        // manager-side, resize must reach both the PTY and the grid.
+        let mut app = mock_app();
+        let before = app.manager.active_tab().unwrap().size();
+        app.manager.resize_all(before.0 + 10, before.1 + 2);
+        let after = app.manager.active_tab().unwrap().size();
+        assert_eq!(after, (before.0 + 10, before.1 + 2));
+    }
+
+    #[test]
+    fn alt_screen_transition_clears_selection() {
+        let mut app = mock_app();
+        // The child prints the alt-screen switch from its own output (we
+        // can't write it to stdin: the tty line discipline echoes ESC as a
+        // literal "^[" pair in canonical mode, so the parser never sees it).
+        let profile = crate::config::Profile {
+            command: vec![
+                "sh".into(),
+                "-c".into(),
+                "printf 'MARKALT'; sleep 0.3; printf '\\033[?1049h'; sleep 5".into(),
+            ],
+            ..crate::config::Profile::default()
+        };
+        while !app.manager.tabs.is_empty() {
+            app.manager.close_tab(0);
+        }
+        app.manager.open_tab(&profile, Some("test".into()), 40, 10).unwrap();
+        wait_grid(&mut app, "MARKALT");
+
+        app.session.selection.begin(
+            crate::mouse::SelectionKind::Simple,
+            SelPoint { line: 0, col: 0 },
+        );
+        // First observation records the (off) state without clearing.
+        app.invalidate_selection_on_alt_screen_change();
+        assert!(app.session.selection.is_active());
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline {
+            let _ = app.manager.poll_all();
+            if app.manager.active_tab().unwrap().alternate_screen() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            app.manager.active_tab().unwrap().alternate_screen(),
+            "child should have entered the alt screen"
+        );
+        app.invalidate_selection_on_alt_screen_change();
+        assert!(
+            !app.session.selection.is_active(),
+            "alt-screen transition must clear the selection"
+        );
     }
 }

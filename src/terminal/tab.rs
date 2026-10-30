@@ -270,6 +270,16 @@ impl TerminalTab {
 
     // ─── mode bridges ────────────────────────────────────────────────────────
 
+    /// Reset the local emulator state (the RIS escape action): modes, colors,
+    /// charsets, scroll regions, tab stops, alt screen, title stack. This is
+    /// what the `reset`/ResetTerminal command should do to *our* parser —
+    /// writing RIS bytes to the PTY would only feed them to the child's stdin.
+    pub fn reset_state(&mut self) {
+        use alacritty_terminal::vte::ansi::Handler;
+        self.term.reset_state();
+        self.drain_event_channel();
+    }
+
     /// The child's negotiated mouse-reporting mode, as a [`MouseMode`].
     ///
     /// Bridges alacritty's `TermMode` bits:
